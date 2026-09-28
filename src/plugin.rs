@@ -395,8 +395,9 @@ const fn loopback_for(ip: IpAddr) -> IpAddr {
 
 /// `true` when the proxy listener would receive the fallback requests.
 fn loops(bind: SocketAddr, target: SocketAddr) -> bool {
+    let wildcard_bind = bind.ip().is_unspecified();
     bind.port() == target.port()
-        && (bind.ip() == target.ip() || bind.ip().is_unspecified() && target.ip().is_loopback())
+        && (bind.ip() == target.ip() || (wildcard_bind && target.ip().is_loopback()))
 }
 
 /// `true` when Autumn trusts forwarded headers from `127.0.0.1`.
@@ -412,30 +413,39 @@ fn trusts_loopback(autumn: &AutumnConfig) -> bool {
 
 /// `true` when `range` (an IP or CIDR) contains `ip`.
 fn range_contains(range: &str, ip: IpAddr) -> bool {
-    let (base, bits) = range
-        .trim()
-        .split_once('/')
-        .map_or((range.trim(), None), |(base, bits)| (base, Some(bits)));
-    let Ok(base) = base.parse::<IpAddr>() else {
+    let range = range.trim();
+    let (base, bits) = match range.split_once('/') {
+        Some((base, bits)) => (base, Some(bits)),
+        None => (range, None),
+    };
+    let (Ok(base), Ok(bits)) = (
+        base.parse::<IpAddr>(),
+        bits.map(str::parse::<u32>).transpose(),
+    ) else {
         return false;
     };
     match (base, ip) {
-        (IpAddr::V4(base), IpAddr::V4(ip)) => {
-            let bits = bits.map_or(Some(32), |b| b.parse::<u32>().ok().filter(|b| *b <= 32));
-            bits.is_some_and(|bits| {
-                let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
-                u32::from(base) & mask == u32::from(ip) & mask
-            })
-        }
+        (IpAddr::V4(base), IpAddr::V4(ip)) => same_prefix(
+            u128::from(u32::from(base)),
+            u128::from(u32::from(ip)),
+            32,
+            bits,
+        ),
         (IpAddr::V6(base), IpAddr::V6(ip)) => {
-            let bits = bits.map_or(Some(128), |b| b.parse::<u32>().ok().filter(|b| *b <= 128));
-            bits.is_some_and(|bits| {
-                let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
-                u128::from(base) & mask == u128::from(ip) & mask
-            })
+            same_prefix(u128::from(base), u128::from(ip), 128, bits)
         }
         _ => false,
     }
+}
+
+/// `true` when the first `bits` (default: all `width`) bits are equal.
+fn same_prefix(base: u128, ip: u128, width: u32, bits: Option<u32>) -> bool {
+    let bits = bits.unwrap_or(width);
+    if bits > width {
+        return false;
+    }
+    let shift = width - bits;
+    base.checked_shr(shift).unwrap_or(0) == ip.checked_shr(shift).unwrap_or(0)
 }
 
 /// Autumn runs plugin shutdown hooks inside `server.shutdown_timeout_secs`.

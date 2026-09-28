@@ -13,7 +13,7 @@ use common::{boot_with, get, plugin, route, upstream};
 /// plays the Autumn app.
 fn app_at(addr: std::net::SocketAddr) -> AutumnConfig {
     let mut config = AutumnConfig::default();
-    config.server.host = "0.0.0.0".to_owned();
+    "0.0.0.0".clone_into(&mut config.server.host);
     config.server.port = addr.port();
     config
 }
@@ -57,7 +57,7 @@ async fn a_proxy_on_the_app_address_aborts_boot() {
     let port = taken.local_addr().unwrap().port();
     drop(taken);
     let mut config = AutumnConfig::default();
-    config.server.host = "127.0.0.1".to_owned();
+    "127.0.0.1".clone_into(&mut config.server.host);
     config.server.port = port;
     let plugin = plugin()
         .fallback(Fallback::App)

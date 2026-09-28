@@ -19,6 +19,16 @@ enum Balancer {
     Consistent(LoadBalancer<Consistent>),
 }
 
+/// Run `$body` with `$lb` bound to the inner `LoadBalancer`.
+macro_rules! with_lb {
+    ($balancer:expr, $lb:ident => $body:expr) => {
+        match $balancer {
+            Balancer::RoundRobin($lb) => $body,
+            Balancer::Consistent($lb) => $body,
+        }
+    };
+}
+
 /// The upstreams of one route.
 pub struct Pool {
     balancer: Balancer,
@@ -81,19 +91,13 @@ impl Pool {
                     .as_inet()
                     .is_some_and(|addr| !skip.contains(addr))
         };
-        let backend = match &self.balancer {
-            Balancer::RoundRobin(lb) => lb.select_with(key, MAX_ITERATIONS, accept),
-            Balancer::Consistent(lb) => lb.select_with(key, MAX_ITERATIONS, accept),
-        }?;
+        let backend = with_lb!(&self.balancer, lb => lb.select_with(key, MAX_ITERATIONS, accept))?;
         backend.addr.as_inet().copied()
     }
 
     /// Healthy upstreams.
     pub fn healthy(&self) -> usize {
-        let backends = match &self.balancer {
-            Balancer::RoundRobin(lb) => lb.backends(),
-            Balancer::Consistent(lb) => lb.backends(),
-        };
+        let backends = with_lb!(&self.balancer, lb => lb.backends());
         backends
             .get_backend()
             .iter()
@@ -108,10 +112,7 @@ impl Pool {
 
     /// Run one health check round on all upstreams.
     pub async fn check(&self) {
-        match &self.balancer {
-            Balancer::RoundRobin(lb) => lb.backends().run_health_check(true).await,
-            Balancer::Consistent(lb) => lb.backends().run_health_check(true).await,
-        }
+        with_lb!(&self.balancer, lb => lb.backends().run_health_check(true).await);
     }
 }
 

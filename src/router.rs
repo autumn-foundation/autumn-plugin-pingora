@@ -40,7 +40,7 @@ impl HostRule {
     }
 
     /// Higher is more specific.
-    fn rank(&self) -> (u8, usize) {
+    const fn rank(&self) -> (u8, usize) {
         match self {
             Self::Any => (0, 0),
             Self::Wildcard(suffix) => (1, suffix.len()),
@@ -140,10 +140,7 @@ pub fn strip_prefix(path_and_query: &str, prefix: &str) -> String {
         return path_and_query.to_owned();
     };
     let rest = if rest.is_empty() { "/" } else { rest };
-    match query {
-        Some(query) => format!("{rest}?{query}"),
-        None => rest.to_owned(),
-    }
+    query.map_or_else(|| rest.to_owned(), |query| format!("{rest}?{query}"))
 }
 
 #[cfg(test)]
@@ -160,105 +157,93 @@ mod tests {
         route
     }
 
-    fn names(routes: &[RouteConfig], router: &Router, host: Option<&str>, path: &str) -> String {
-        router
-            .find(host, path)
-            .map_or_else(|| "-".to_owned(), |i| routes[i].name.clone())
+    /// Routes and their router. `pick` gives the route name, or `-`.
+    struct Table(Vec<RouteConfig>, Router);
+
+    impl Table {
+        fn new(list: Vec<RouteConfig>) -> Self {
+            let router = Router::new(&list);
+            Self(list, router)
+        }
+
+        fn pick(&self, host: Option<&str>, path: &str) -> &str {
+            self.1
+                .find(host, path)
+                .map_or("-", |i| self.0[i].name.as_str())
+        }
     }
 
     #[test]
     fn prefixes_match_on_a_segment_boundary() {
-        let routes = vec![route("api", "", "/api")];
-        let router = Router::new(&routes);
+        let table = Table::new(vec![route("api", "", "/api")]);
         for path in ["/api", "/api/", "/api/users", "/api/a/b"] {
-            assert_eq!(names(&routes, &router, None, path), "api", "{path}");
+            assert_eq!(table.pick(None, path), "api", "{path}");
         }
         for path in ["/", "/apix", "/ap", "/API", ""] {
-            assert_eq!(names(&routes, &router, None, path), "-", "{path}");
+            assert_eq!(table.pick(None, path), "-", "{path}");
         }
     }
 
     #[test]
     fn a_trailing_slash_in_the_prefix_is_the_same_prefix() {
-        let routes = vec![route("api", "", "/api/")];
-        let router = Router::new(&routes);
-        assert_eq!(names(&routes, &router, None, "/api"), "api");
-        assert_eq!(names(&routes, &router, None, "/api/x"), "api");
-        assert_eq!(names(&routes, &router, None, "/apix"), "-");
+        let table = Table::new(vec![route("api", "", "/api/")]);
+        assert_eq!(table.pick(None, "/api"), "api");
+        assert_eq!(table.pick(None, "/api/x"), "api");
+        assert_eq!(table.pick(None, "/apix"), "-");
     }
 
     #[test]
     fn the_longest_prefix_wins() {
-        let routes = vec![
+        let table = Table::new(vec![
             route("root", "", "/"),
             route("api", "", "/api"),
             route("v2", "", "/api/v2"),
-        ];
-        let router = Router::new(&routes);
-        assert_eq!(names(&routes, &router, None, "/"), "root");
-        assert_eq!(names(&routes, &router, None, "/other"), "root");
-        assert_eq!(names(&routes, &router, None, "/api/v1"), "api");
-        assert_eq!(names(&routes, &router, None, "/api/v2/x"), "v2");
-        assert_eq!(names(&routes, &router, None, "/api/v20"), "api");
+        ]);
+        assert_eq!(table.pick(None, "/"), "root");
+        assert_eq!(table.pick(None, "/other"), "root");
+        assert_eq!(table.pick(None, "/api/v1"), "api");
+        assert_eq!(table.pick(None, "/api/v2/x"), "v2");
+        assert_eq!(table.pick(None, "/api/v20"), "api");
     }
 
     #[test]
     fn a_host_route_wins_over_an_any_host_route() {
-        let routes = vec![
+        let table = Table::new(vec![
             route("any", "", "/api"),
             route("exact", "api.example.com", "/api"),
             route("wild", "*.example.com", "/api"),
-        ];
-        let router = Router::new(&routes);
-        assert_eq!(
-            names(&routes, &router, Some("api.example.com"), "/api"),
-            "exact"
-        );
-        assert_eq!(
-            names(&routes, &router, Some("API.Example.COM:8080"), "/api"),
-            "exact"
-        );
-        assert_eq!(
-            names(&routes, &router, Some("api.example.com."), "/api"),
-            "exact"
-        );
-        assert_eq!(
-            names(&routes, &router, Some("x.example.com"), "/api"),
-            "wild"
-        );
-        assert_eq!(
-            names(&routes, &router, Some("a.b.example.com"), "/api"),
-            "wild"
-        );
-        assert_eq!(names(&routes, &router, Some("example.com"), "/api"), "any");
-        assert_eq!(names(&routes, &router, Some("other.org"), "/api"), "any");
-        assert_eq!(names(&routes, &router, None, "/api"), "any");
+        ]);
+        assert_eq!(table.pick(Some("api.example.com"), "/api"), "exact");
+        assert_eq!(table.pick(Some("API.Example.COM:8080"), "/api"), "exact");
+        assert_eq!(table.pick(Some("api.example.com."), "/api"), "exact");
+        assert_eq!(table.pick(Some("x.example.com"), "/api"), "wild");
+        assert_eq!(table.pick(Some("a.b.example.com"), "/api"), "wild");
+        assert_eq!(table.pick(Some("example.com"), "/api"), "any");
+        assert_eq!(table.pick(Some("other.org"), "/api"), "any");
+        assert_eq!(table.pick(None, "/api"), "any");
     }
 
     #[test]
     fn a_longer_prefix_wins_over_a_host() {
-        let routes = vec![route("host", "a.com", "/"), route("deep", "", "/x/y")];
-        let router = Router::new(&routes);
-        assert_eq!(names(&routes, &router, Some("a.com"), "/x/y/z"), "deep");
-        assert_eq!(names(&routes, &router, Some("a.com"), "/x"), "host");
+        let table = Table::new(vec![route("host", "a.com", "/"), route("deep", "", "/x/y")]);
+        assert_eq!(table.pick(Some("a.com"), "/x/y/z"), "deep");
+        assert_eq!(table.pick(Some("a.com"), "/x"), "host");
     }
 
     #[test]
     fn a_host_route_does_not_match_other_hosts() {
-        let routes = vec![route("wild", "*.example.com", "/")];
-        let router = Router::new(&routes);
-        assert_eq!(names(&routes, &router, Some("example.com"), "/"), "-");
-        assert_eq!(names(&routes, &router, Some("badexample.com"), "/"), "-");
-        assert_eq!(names(&routes, &router, None, "/"), "-");
-        assert_eq!(names(&routes, &router, Some("[::1]:80"), "/"), "-");
+        let table = Table::new(vec![route("wild", "*.example.com", "/")]);
+        assert_eq!(table.pick(Some("example.com"), "/"), "-");
+        assert_eq!(table.pick(Some("badexample.com"), "/"), "-");
+        assert_eq!(table.pick(None, "/"), "-");
+        assert_eq!(table.pick(Some("[::1]:80"), "/"), "-");
     }
 
     #[test]
     fn ipv6_hosts_lose_the_port_only() {
-        let routes = vec![route("v6", "[::1]", "/")];
-        let router = Router::new(&routes);
-        assert_eq!(names(&routes, &router, Some("[::1]:8080"), "/"), "v6");
-        assert_eq!(names(&routes, &router, Some("[::1]"), "/"), "v6");
+        let table = Table::new(vec![route("v6", "[::1]", "/")]);
+        assert_eq!(table.pick(Some("[::1]:8080"), "/"), "v6");
+        assert_eq!(table.pick(Some("[::1]"), "/"), "v6");
     }
 
     #[test]

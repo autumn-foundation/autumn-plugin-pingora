@@ -54,6 +54,8 @@ mod tests {
     use super::*;
     use http::HeaderValue;
 
+    /// `None`: no change. `Some(None)`: remove. `Some(Some(v))`: set `v`.
+    #[allow(clippy::option_option)]
     fn get<'a>(changes: &'a [Change], name: &str) -> Option<Option<&'a str>> {
         changes
             .iter()

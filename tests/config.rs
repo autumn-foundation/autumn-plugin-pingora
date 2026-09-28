@@ -1,5 +1,7 @@
 //! Configuration: AC1 and AC2.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+
 use std::path::{Path, PathBuf};
 
 use autumn_plugin_pingora::{Fallback, PingoraConfig, RouteConfig, Selection};
@@ -154,31 +156,31 @@ fn bad_routes_are_rejected() {
         (route("a", "/a", "http://127.0.0.1:80"), "upstream"),
         (
             edit(route("a", "/a", "127.0.0.1:1"), |r| {
-                r.upstreams = Vec::new()
+                r.upstreams = Vec::new();
             }),
             "upstreams",
         ),
         (
             edit(route("a", "/a", "127.0.0.1:1"), |r| {
-                r.host = "bad host".to_owned()
+                r.host = "bad host".to_owned();
             }),
             "host",
         ),
         (
             edit(route("a", "/a", "127.0.0.1:1"), |r| {
-                r.host = "example.com:8080".to_owned()
+                r.host = "example.com:8080".to_owned();
             }),
             "host",
         ),
         (
             edit(route("a", "/a", "127.0.0.1:1"), |r| {
-                r.host = "a.*.com".to_owned()
+                r.host = "a.*.com".to_owned();
             }),
             "host",
         ),
         (
             edit(route("a", "/a", "127.0.0.1:1"), |r| {
-                r.upstream_host = "evil\r\nx: y".to_owned()
+                r.upstream_host = "evil\r\nx: y".to_owned();
             }),
             "upstream_host",
         ),

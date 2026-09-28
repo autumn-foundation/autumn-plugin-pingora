@@ -218,6 +218,7 @@ impl Resolved {
 
     /// Configuration from code. The plugin reads no files. The profile
     /// still comes from the environment.
+    #[expect(dead_code, reason = "the plugin uses it (slice 2)")]
     pub(crate) fn explicit(config: PingoraConfig) -> Self {
         let profile = autumn_web::dotenv::os_env_with_dotenv().map_or_else(
             |_| resolve_active_profile(&autumn_web::config::OsEnv).1,
@@ -236,7 +237,7 @@ const fn millis(ms: u64) -> Option<Duration> {
 }
 
 /// Names that metrics use for requests with no route.
-pub(crate) const RESERVED_NAMES: [&str; 2] = ["fallback", "unmatched"];
+pub const RESERVED_NAMES: [&str; 2] = ["fallback", "unmatched"];
 
 impl PingoraConfig {
     /// The listen address. An empty `bind` gives `127.0.0.1:8080` in
@@ -420,7 +421,7 @@ impl PingoraConfig {
 }
 
 /// A prefix without a trailing `/`. The root prefix is empty.
-pub(crate) fn normalize_prefix(prefix: &str) -> String {
+pub fn normalize_prefix(prefix: &str) -> String {
     let trimmed = prefix.trim();
     let trimmed = if trimmed.is_empty() { "/" } else { trimmed };
     trimmed.trim_end_matches('/').to_owned()

@@ -218,7 +218,6 @@ impl Resolved {
 
     /// Configuration from code. The plugin reads no files. The profile
     /// still comes from the environment.
-    #[expect(dead_code, reason = "the plugin uses it (slice 2)")]
     pub(crate) fn explicit(config: PingoraConfig) -> Self {
         let profile = autumn_web::dotenv::os_env_with_dotenv().map_or_else(
             |_| resolve_active_profile(&autumn_web::config::OsEnv).1,

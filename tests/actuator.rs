@@ -47,11 +47,13 @@ async fn metrics_count_requests_by_route_and_status_class() {
     let a = upstream("a").await;
     let (http, handle) = boot_with(
         TestApp::new(),
-        plugin().route(route("a", "/a", &[&a])).route(
-            autumn_plugin_pingora::Route::new("dead")
-                .path_prefix("/dead")
-                .upstream(dead_address()),
-        ),
+        plugin()
+            .route(route("a", "/a", &[&a]).strip_prefix(true))
+            .route(
+                autumn_plugin_pingora::Route::new("dead")
+                    .path_prefix("/dead")
+                    .upstream(dead_address()),
+            ),
     );
     get(&handle, "/a/1").await;
     get(&handle, "/a/2").await;

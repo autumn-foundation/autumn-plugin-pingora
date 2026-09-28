@@ -1,6 +1,6 @@
 //! Route match and prefix strip. Pure functions.
 
-use crate::config::{RouteConfig, normalize_prefix};
+use crate::config::{Route, normalize_prefix};
 
 /// Finds the route for a request.
 ///
@@ -64,7 +64,7 @@ impl Router {
     /// A router over `routes`. The index of a match is the index in
     /// `routes`.
     #[must_use]
-    pub fn new(routes: &[RouteConfig]) -> Self {
+    pub fn new(routes: &[Route]) -> Self {
         let mut entries: Vec<Entry> = routes
             .iter()
             .enumerate()
@@ -148,8 +148,8 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn route(name: &str, host: &str, prefix: &str) -> RouteConfig {
-        let mut route = RouteConfig::default();
+    fn route(name: &str, host: &str, prefix: &str) -> Route {
+        let mut route = Route::default();
         name.clone_into(&mut route.name);
         host.clone_into(&mut route.host);
         prefix.clone_into(&mut route.path_prefix);
@@ -158,10 +158,10 @@ mod tests {
     }
 
     /// Routes and their router. `pick` gives the route name, or `-`.
-    struct Table(Vec<RouteConfig>, Router);
+    struct Table(Vec<Route>, Router);
 
     impl Table {
-        fn new(list: Vec<RouteConfig>) -> Self {
+        fn new(list: Vec<Route>) -> Self {
             let router = Router::new(&list);
             Self(list, router)
         }
@@ -287,7 +287,7 @@ mod tests {
             prefixes in proptest::collection::vec("(/[a-c]{1,2}){0,3}", 1..6),
             path in "(/[a-c]{0,2}){0,4}",
         ) {
-            let routes: Vec<RouteConfig> = prefixes
+            let routes: Vec<Route> = prefixes
                 .iter()
                 .enumerate()
                 .map(|(i, p)| {

@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use autumn_plugin_pingora::{Fallback, PingoraConfig, RouteConfig, Selection};
+use autumn_plugin_pingora::{Fallback, PingoraConfig, Route, Selection};
 use autumn_web::config::MockEnv;
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -21,20 +21,20 @@ fn env_for(dir: &Path) -> MockEnv {
     MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_str().unwrap())
 }
 
-fn route(name: &str, prefix: &str, upstream: &str) -> RouteConfig {
-    let mut route = RouteConfig::default();
+fn route(name: &str, prefix: &str, upstream: &str) -> Route {
+    let mut route = Route::default();
     name.clone_into(&mut route.name);
     prefix.clone_into(&mut route.path_prefix);
     route.upstreams = vec![upstream.to_owned()];
     route
 }
 
-fn edit(mut route: RouteConfig, change: impl FnOnce(&mut RouteConfig)) -> RouteConfig {
+fn edit(mut route: Route, change: impl FnOnce(&mut Route)) -> Route {
     change(&mut route);
     route
 }
 
-fn with_routes(routes: Vec<RouteConfig>) -> PingoraConfig {
+fn with_routes(routes: Vec<Route>) -> PingoraConfig {
     let mut config = PingoraConfig::default();
     config.routes = routes;
     config
@@ -142,7 +142,7 @@ fn bad_scalar_values_are_rejected() {
 
 #[test]
 fn bad_routes_are_rejected() {
-    let cases: Vec<(RouteConfig, &str)> = vec![
+    let cases: Vec<(Route, &str)> = vec![
         (route("", "/a", "127.0.0.1:1"), "name"),
         (route("has space", "/a", "127.0.0.1:1"), "name"),
         (route("fallback", "/a", "127.0.0.1:1"), "reserved"),

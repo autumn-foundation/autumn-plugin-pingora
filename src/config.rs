@@ -72,7 +72,7 @@ impl fmt::Display for Selection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
-pub struct RouteConfig {
+pub struct Route {
     /// Unique name, used in metrics and logs. Letters, digits, `_`, `-`
     /// and `.` only. `fallback` and `unmatched` are reserved.
     pub name: String,
@@ -93,7 +93,7 @@ pub struct RouteConfig {
     pub selection: Selection,
 }
 
-impl Default for RouteConfig {
+impl Default for Route {
     fn default() -> Self {
         Self {
             name: String::new(),
@@ -152,7 +152,7 @@ pub struct PingoraConfig {
     pub metrics: bool,
     /// The routes. Env: `AUTUMN_PINGORA__ROUTES` replaces all routes with
     /// a TOML array.
-    pub routes: Vec<RouteConfig>,
+    pub routes: Vec<Route>,
 }
 
 impl Default for PingoraConfig {
@@ -427,7 +427,69 @@ pub fn normalize_prefix(prefix: &str) -> String {
     trimmed.trim_end_matches('/').to_owned()
 }
 
-impl RouteConfig {
+impl Route {
+    /// A route with `name`, the root prefix and no upstreams.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Match this host: `api.example.com` or `*.example.com`.
+    #[must_use]
+    pub fn host(mut self, host: impl Into<String>) -> Self {
+        self.host = host.into();
+        self
+    }
+
+    /// Match this path prefix.
+    #[must_use]
+    pub fn path_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.path_prefix = prefix.into();
+        self
+    }
+
+    /// Add an upstream, `host:port`.
+    #[must_use]
+    pub fn upstream(mut self, upstream: impl Into<String>) -> Self {
+        self.upstreams.push(upstream.into());
+        self
+    }
+
+    /// Add upstreams, `host:port`.
+    #[must_use]
+    pub fn upstreams<I, S>(mut self, upstreams: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.upstreams.extend(upstreams.into_iter().map(Into::into));
+        self
+    }
+
+    /// Remove the prefix before the request goes upstream.
+    #[must_use]
+    pub const fn strip_prefix(mut self, strip: bool) -> Self {
+        self.strip_prefix = strip;
+        self
+    }
+
+    /// Send this `Host` header upstream.
+    #[must_use]
+    pub fn upstream_host(mut self, host: impl Into<String>) -> Self {
+        self.upstream_host = host.into();
+        self
+    }
+
+    /// Pick upstreams with `selection`.
+    #[must_use]
+    pub const fn selection(mut self, selection: Selection) -> Self {
+        self.selection = selection;
+        self
+    }
+
     /// Reject a route that cannot work.
     ///
     /// # Errors

@@ -49,3 +49,7 @@ unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
 module_name_repetitions = "allow"
+
+[[example]]
+name = "gateway"
+path = "examples/gateway.rs"

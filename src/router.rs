@@ -1,8 +1,11 @@
 //! Route match and prefix strip. Pure functions.
 
-use crate::config::RouteConfig;
+use crate::config::{RouteConfig, normalize_prefix};
 
 /// Finds the route for a request.
+///
+/// The longest path prefix wins. At the same prefix, an exact host wins
+/// over a wildcard host, and a host wins over no host.
 #[derive(Debug, Clone, Default)]
 pub struct Router {
     entries: Vec<Entry>,
@@ -11,33 +14,136 @@ pub struct Router {
 #[derive(Debug, Clone)]
 struct Entry {
     index: usize,
+    host: HostRule,
+    /// Without a trailing `/`. The root prefix is empty.
+    prefix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostRule {
+    Any,
+    /// `.example.com` for `*.example.com`.
+    Wildcard(String),
+    Exact(String),
+}
+
+impl HostRule {
+    fn parse(pattern: &str) -> Self {
+        let pattern = pattern.trim().to_ascii_lowercase();
+        if pattern.is_empty() {
+            Self::Any
+        } else if let Some(suffix) = pattern.strip_prefix('*') {
+            Self::Wildcard(suffix.to_owned())
+        } else {
+            Self::Exact(pattern)
+        }
+    }
+
+    /// Higher is more specific.
+    fn rank(&self) -> (u8, usize) {
+        match self {
+            Self::Any => (0, 0),
+            Self::Wildcard(suffix) => (1, suffix.len()),
+            Self::Exact(_) => (2, 0),
+        }
+    }
+
+    fn matches(&self, host: Option<&str>) -> bool {
+        match (self, host) {
+            (Self::Any, _) => true,
+            (_, None) => false,
+            (Self::Exact(want), Some(host)) => want == host,
+            (Self::Wildcard(suffix), Some(host)) => {
+                host.len() > suffix.len() && host.ends_with(suffix.as_str())
+            }
+        }
+    }
 }
 
 impl Router {
     /// A router over `routes`. The index of a match is the index in
     /// `routes`.
     #[must_use]
-    pub fn new(_routes: &[RouteConfig]) -> Self {
-        Self::default()
+    pub fn new(routes: &[RouteConfig]) -> Self {
+        let mut entries: Vec<Entry> = routes
+            .iter()
+            .enumerate()
+            .map(|(index, route)| Entry {
+                index,
+                host: HostRule::parse(&route.host),
+                prefix: normalize_prefix(&route.path_prefix),
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            b.prefix
+                .len()
+                .cmp(&a.prefix.len())
+                .then_with(|| b.host.rank().cmp(&a.host.rank()))
+                .then_with(|| a.index.cmp(&b.index))
+        });
+        Self { entries }
     }
 
-    /// The index of the best route for `host` and `path`.
+    /// The index of the best route for `host` (a `Host` header value) and
+    /// `path` (no query).
     #[must_use]
-    pub fn find(&self, _host: Option<&str>, _path: &str) -> Option<usize> {
-        self.entries.first().map(|e| e.index)
+    pub fn find(&self, host: Option<&str>, path: &str) -> Option<usize> {
+        let host = host.map(normalize_host);
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.host.matches(host.as_deref()) && prefix_matches(&entry.prefix, path)
+            })
+            .map(|entry| entry.index)
     }
+}
+
+/// Lower case, no port, no trailing `.`. `[::1]:80` gives `[::1]`.
+fn normalize_host(raw: &str) -> String {
+    let raw = raw.trim();
+    let host = if raw.starts_with('[') {
+        raw.find(']').map_or(raw, |end| &raw[..=end])
+    } else {
+        raw.split_once(':').map_or(raw, |(host, _)| host)
+    };
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// `prefix` (normalized) is a segment prefix of `path`.
+fn prefix_matches(prefix: &str, path: &str) -> bool {
+    if prefix.is_empty() {
+        return path.starts_with('/');
+    }
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// `true` when `path` has a `.` or `..` segment, also percent-encoded.
 #[must_use]
-pub fn has_dot_segment(_path: &str) -> bool {
-    false
+pub fn has_dot_segment(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    path.split('/').any(|segment| {
+        let decoded = segment.replace("%2e", ".").replace("%2E", ".");
+        decoded == "." || decoded == ".."
+    })
 }
 
 /// The request target after the route prefix is removed. The query stays.
 #[must_use]
-pub fn strip_prefix(path_and_query: &str, _prefix: &str) -> String {
-    path_and_query.to_owned()
+pub fn strip_prefix(path_and_query: &str, prefix: &str) -> String {
+    let prefix = normalize_prefix(prefix);
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path_and_query, None),
+    };
+    let Some(rest) = path.strip_prefix(prefix.as_str()) else {
+        return path_and_query.to_owned();
+    };
+    let rest = if rest.is_empty() { "/" } else { rest };
+    match query {
+        Some(query) => format!("{rest}?{query}"),
+        None => rest.to_owned(),
+    }
 }
 
 #[cfg(test)]

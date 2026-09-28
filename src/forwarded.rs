@@ -13,12 +13,40 @@ pub type Change = (&'static str, Option<String>);
 /// choose the address that the upstream sees.
 #[must_use]
 pub fn changes(
-    _client: Option<IpAddr>,
-    _incoming: &HeaderMap,
-    _host: Option<&str>,
-    _trust: bool,
+    client: Option<IpAddr>,
+    incoming: &HeaderMap,
+    host: Option<&str>,
+    trust: bool,
 ) -> Vec<Change> {
-    Vec::new()
+    let kept = |name: &str| trust.then(|| joined(incoming, name)).flatten();
+    let client = client.map(|ip| ip.to_string());
+    let for_value = match (kept("x-forwarded-for"), client) {
+        (Some(chain), Some(ip)) => Some(format!("{chain}, {ip}")),
+        (chain, ip) => ip.or(chain),
+    };
+    let proto = kept("x-forwarded-proto").unwrap_or_else(|| "http".to_owned());
+    let forwarded_host = kept("x-forwarded-host").or_else(|| host.map(str::to_owned));
+    let mut out = vec![
+        ("x-forwarded-for", for_value),
+        ("x-forwarded-proto", Some(proto)),
+        ("x-forwarded-host", forwarded_host),
+    ];
+    if !trust {
+        out.push(("forwarded", None));
+    }
+    out
+}
+
+/// All values of `name`, joined with `, `. `None` when absent or not text.
+fn joined(headers: &HeaderMap, name: &str) -> Option<String> {
+    let values: Vec<&str> = headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+    (!values.is_empty()).then(|| values.join(", "))
 }
 
 #[cfg(test)]

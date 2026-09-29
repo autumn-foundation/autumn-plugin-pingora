@@ -35,7 +35,6 @@ tracing = "0.1"
 [dev-dependencies]
 axum = "0.8"
 proptest = "1"
-socket2 = "0.6"
 toml = "1.1"
 reqwest = { version = "0.12", default-features = false, features = ["stream"] }
 tokio = { version = "1", features = ["full"] }

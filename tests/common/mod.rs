@@ -208,29 +208,32 @@ where
     false
 }
 
-/// A local port that refuses connections. The socket is bound but does
-/// not listen, so no other test can take the port while it lives.
+/// A local address that refuses connections.
 pub struct Dead {
     addr: SocketAddr,
-    _socket: socket2::Socket,
 }
 
 impl Dead {
-    /// `host:port` of the dead port.
+    /// `host:port` of the dead address.
     pub fn address(&self) -> String {
         self.addr.to_string()
     }
 }
 
-/// A reserved local port that refuses connections.
+/// Privileged loopback ports. Tests cannot bind them, and nothing listens
+/// on them on CI hosts, so a connect is refused at once on Linux and macOS.
+/// (A bound socket without `listen` works on Linux only: macOS drops the
+/// SYN, and the connect times out.)
+const DEAD_PORTS: [u16; 8] = [1, 2, 3, 4, 5, 6, 8, 9];
+
+/// A loopback address that refuses connections. Calls in a row give
+/// different ports.
 pub fn dead() -> Dead {
-    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
-    let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    socket.bind(&any.into()).unwrap();
-    let addr = socket.local_addr().unwrap().as_socket().unwrap();
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let port = DEAD_PORTS[NEXT.fetch_add(1, Ordering::Relaxed) % DEAD_PORTS.len()];
     Dead {
-        addr,
-        _socket: socket,
+        addr: SocketAddr::from(([127, 0, 0, 1], port)),
     }
 }
 

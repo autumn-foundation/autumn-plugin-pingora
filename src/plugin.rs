@@ -15,18 +15,19 @@ use crate::config::{
     ConfigError, DEFAULT_SECTION, Fallback, PingoraConfig, Resolved, Route, normalize_prefix,
 };
 use crate::error::PingoraError;
+use crate::forwarded::IpRange;
 use crate::health::ProxyHealth;
 use crate::metrics::{Metrics, ProxyMetrics};
 use crate::proxy::{Gateway, Timeouts};
 use crate::router::Router;
-use crate::server::{Launch, PingoraHandle, Shared};
+use crate::server::{Launch, PingoraHandle, Shared, Started};
 use crate::upstream::Pool;
 
 /// The name in `Plugin::name`, logs and errors.
 pub const PLUGIN_NAME: &str = "autumn-plugin-pingora";
 
-/// The `autumn-web` series this release is tested with.
-pub const SUPPORTED_AUTUMN_WEB: &str = "0.7";
+/// Attempts for a request after a pooled upstream connection was stale.
+const REUSE_RETRIES: usize = 2;
 
 /// Time to close aborted connections, inside Autumn's shutdown budget.
 const KILL_WAIT_MS: u64 = 500;
@@ -50,10 +51,15 @@ type Override = Arc<dyn Fn(&mut PingoraConfig) + Send + Sync>;
 /// The plugin reads `[pingora]` from `autumn.toml` (see [`PingoraConfig`]).
 /// Fluent setters apply on top of the file values.
 ///
-/// On boot, the plugin resolves the upstreams, binds the listener (a
-/// failure aborts boot), starts health checks, adds a `pingora` health
-/// indicator and `pingora_proxy_*` metrics, and puts a [`PingoraHandle`]
-/// into `AppState`. It drains on Autumn's shutdown signal.
+/// On boot, the plugin:
+///
+/// - resolves the upstreams,
+/// - binds the listener (a failure stops boot),
+/// - starts the health checks,
+/// - adds a `pingora` health indicator and `pingora_proxy_*` metrics,
+/// - puts a [`PingoraHandle`] into `AppState`.
+///
+/// The plugin drains when Autumn's shutdown signal fires.
 pub struct PingoraPlugin {
     explicit: Option<Box<PingoraConfig>>,
     overrides: Vec<Override>,
@@ -105,7 +111,8 @@ impl PingoraPlugin {
         self
     }
 
-    /// Use `config` and read no files or environment variables. Fluent
+    /// Use `config` and read no config files. The profile still comes from
+    /// the environment (see [`development`](Self::development)). Fluent
     /// setters still apply on top.
     #[must_use]
     pub fn config(mut self, config: PingoraConfig) -> Self {
@@ -136,9 +143,8 @@ impl PingoraPlugin {
         self.configure(move |c| c.fallback = fallback)
     }
 
-    /// Declare the proxied prefixes open to all clients. `autumn routes`
-    /// then shows them as public. Without this call they are
-    /// unclassified, and `autumn routes audit` fails on them.
+    /// Mark the proxied prefixes as public in `autumn routes`. If you do
+    /// not, they are unclassified. Then `autumn routes audit` fails.
     #[must_use]
     pub const fn public(mut self) -> Self {
         self.public = true;
@@ -241,10 +247,14 @@ impl Plugin for PingoraPlugin {
                 let config = config.clone();
                 async move {
                     match launch(&state, config, development, &shared).await {
-                        Ok(addr) => {
+                        Ok(Started::Serving(addr)) => {
                             tracing::info!(%addr, "pingora proxy listening");
                             state.insert_extension(PingoraHandle::new(shared.clone()));
                             drain_on_autumn_shutdown(&state, shared);
+                            Ok(())
+                        }
+                        Ok(Started::Stopped) => {
+                            tracing::info!("pingora proxy stopped before it started");
                             Ok(())
                         }
                         Err(error) => {
@@ -292,7 +302,7 @@ async fn launch(
     mut config: PingoraConfig,
     development: bool,
     shared: &Arc<Shared>,
-) -> Result<SocketAddr, PingoraError> {
+) -> Result<Started, PingoraError> {
     if shared.lifecycle.get() != crate::Lifecycle::Idle {
         return Err(PingoraError::AlreadyStarted);
     }
@@ -300,11 +310,11 @@ async fn launch(
     let bind = config.bind_addr(development)?;
     let fallback = match config.fallback {
         Fallback::App => Some(app_target(&autumn, bind).await?),
-        Fallback::None => None,
+        Fallback::NotFound => None,
     };
-    if fallback.is_some() && !trusts_loopback(&autumn) {
+    if fallback.is_some_and(|target| !trusts_proxy(&autumn, target)) {
         tracing::warn!(
-            "pingora proxy: the Autumn app does not trust the proxy, so it sees 127.0.0.1 as the client; add 127.0.0.1/32 to `security.trusted_proxies.ranges` and set `trust_forwarded_headers = true`"
+            "pingora proxy: the Autumn app does not trust the proxy. The app sees 127.0.0.1 as the client. Add 127.0.0.1/32 to `security.trusted_proxies.ranges`. Set `security.trusted_proxies.trust_forwarded_headers = true`"
         );
     }
     fit_grace(&mut config, &autumn);
@@ -326,8 +336,13 @@ async fn launch(
         .map_err(|source| PingoraError::Bind { addr: bind, source })?;
 
     let server_conf = Arc::new(ServerConf {
-        // Pingora counts attempts, not retries.
-        max_retries: config.max_retries.saturating_add(1),
+        // Pingora counts all attempts: the first one, connect retries
+        // (capped in `fail_to_connect`) and retries on a stale pooled
+        // connection.
+        max_retries: config
+            .max_retries
+            .saturating_add(1)
+            .saturating_add(REUSE_RETRIES),
         ..ServerConf::default()
     });
     let gateway = Gateway {
@@ -335,8 +350,13 @@ async fn launch(
         routes: config.routes.clone(),
         pools: pools.clone(),
         fallback,
-        trust_forwarded: config.trust_forwarded_headers,
+        trusted: config
+            .trusted_proxies
+            .iter()
+            .filter_map(|range| IpRange::parse(range))
+            .collect(),
         max_body: config.max_request_body_bytes,
+        max_retries: config.max_retries,
         timeouts: Timeouts {
             connect: config.connect_timeout(),
             read: config.read_timeout(),
@@ -353,11 +373,11 @@ async fn launch(
             pools,
             route_names,
             max_connections: config.max_connections,
+            max_connections_per_ip: config.max_connections_per_ip,
             grace: config.shutdown_grace(),
             health_interval: config.health_check_interval(),
         },
     )
-    .map_err(|source| PingoraError::Bind { addr: bind, source })
 }
 
 /// The Autumn app address for `fallback = "app"` (ADR 0002).
@@ -367,6 +387,11 @@ async fn app_target(autumn: &AutumnConfig, bind: SocketAddr) -> Result<SocketAdd
     }
     let host = autumn.server.host.trim();
     let port = autumn.server.port;
+    if port == 0 {
+        return Err(PingoraError::AppAddress(format!(
+            "{host}:0 (the port is not known before boot; set `server.port`)"
+        )));
+    }
     let target = match host.parse::<IpAddr>() {
         Ok(ip) => SocketAddr::new(loopback_for(ip), port),
         Err(_) if host.eq_ignore_ascii_case("localhost") => {
@@ -394,58 +419,38 @@ const fn loopback_for(ip: IpAddr) -> IpAddr {
 }
 
 /// `true` when the proxy listener would receive the fallback requests.
+/// Port `0` binds a new port, so it never loops.
 fn loops(bind: SocketAddr, target: SocketAddr) -> bool {
     let wildcard_bind = bind.ip().is_unspecified();
-    bind.port() == target.port()
+    bind.port() != 0
+        && bind.port() == target.port()
         && (bind.ip() == target.ip() || (wildcard_bind && target.ip().is_loopback()))
 }
 
-/// `true` when Autumn trusts forwarded headers from `127.0.0.1`.
-fn trusts_loopback(autumn: &AutumnConfig) -> bool {
+/// `true` when Autumn takes the client from the proxy's `X-Forwarded-For`.
+///
+/// The proxy connects from loopback and sends one `X-Forwarded-For` entry.
+/// Autumn trusts all peers when `ranges` is empty. `trusted_hops = 0`
+/// takes the last entry; a larger count skips the client.
+fn trusts_proxy(autumn: &AutumnConfig, target: SocketAddr) -> bool {
     let policy = &autumn.security.trusted_proxies;
+    let proxy_ip = if target.is_ipv6() {
+        IpAddr::V6(Ipv6Addr::LOCALHOST)
+    } else {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    };
     policy.trust_forwarded_headers
-        && (policy.trusted_hops.is_some()
-            || policy
-                .ranges
-                .iter()
-                .any(|range| range_contains(range, IpAddr::V4(Ipv4Addr::LOCALHOST))))
-}
-
-/// `true` when `range` (an IP or CIDR) contains `ip`.
-fn range_contains(range: &str, ip: IpAddr) -> bool {
-    let range = range.trim();
-    let (base, bits) = match range.split_once('/') {
-        Some((base, bits)) => (base, Some(bits)),
-        None => (range, None),
-    };
-    let (Ok(base), Ok(bits)) = (
-        base.parse::<IpAddr>(),
-        bits.map(str::parse::<u32>).transpose(),
-    ) else {
-        return false;
-    };
-    match (base, ip) {
-        (IpAddr::V4(base), IpAddr::V4(ip)) => same_prefix(
-            u128::from(u32::from(base)),
-            u128::from(u32::from(ip)),
-            32,
-            bits,
-        ),
-        (IpAddr::V6(base), IpAddr::V6(ip)) => {
-            same_prefix(u128::from(base), u128::from(ip), 128, bits)
-        }
-        _ => false,
-    }
-}
-
-/// `true` when the first `bits` (default: all `width`) bits are equal.
-fn same_prefix(base: u128, ip: u128, width: u32, bits: Option<u32>) -> bool {
-    let bits = bits.unwrap_or(width);
-    if bits > width {
-        return false;
-    }
-    let shift = width - bits;
-    base.checked_shr(shift).unwrap_or(0) == ip.checked_shr(shift).unwrap_or(0)
+        && policy.trusted_hops.map_or_else(
+            || {
+                policy.ranges.is_empty()
+                    || policy
+                        .ranges
+                        .iter()
+                        .filter_map(|range| IpRange::parse(range))
+                        .any(|range| range.contains(proxy_ip))
+            },
+            |hops| hops == 0,
+        )
 }
 
 /// Autumn runs plugin shutdown hooks inside `server.shutdown_timeout_secs`.
@@ -457,7 +462,7 @@ fn fit_grace(config: &mut PingoraConfig, autumn: &AutumnConfig) {
         tracing::warn!(
             shutdown_grace_ms = config.shutdown_grace_ms,
             limit_ms = limit,
-            "pingora shutdown_grace_ms does not fit in server.shutdown_timeout_secs; using the limit"
+            "pingora `shutdown_grace_ms` is more than `server.shutdown_timeout_secs` permits. The plugin uses the limit"
         );
         config.shutdown_grace_ms = limit;
     }
@@ -513,33 +518,29 @@ mod tests {
         assert!(loops(at("0.0.0.0:3000"), at("127.0.0.1:3000")));
         assert!(!loops(at("0.0.0.0:8080"), at("127.0.0.1:3000")));
         assert!(!loops(at("127.0.0.2:3000"), at("127.0.0.1:3000")));
+        assert!(!loops(at("127.0.0.1:0"), at("127.0.0.1:0")));
     }
 
     #[test]
-    fn ranges_contain_addresses() {
-        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        for range in ["127.0.0.1", "127.0.0.0/8", "0.0.0.0/0", " 127.0.0.1/32 "] {
-            assert!(range_contains(range, lo), "{range}");
-        }
-        for range in ["10.0.0.0/8", "127.0.0.2", "::1", "junk", "127.0.0.0/40"] {
-            assert!(!range_contains(range, lo), "{range}");
-        }
-        assert!(range_contains("::/0", IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        assert!(range_contains("::1/128", IpAddr::V6(Ipv6Addr::LOCALHOST)));
-    }
-
-    #[test]
-    fn trust_needs_the_switch_and_a_range_or_hops() {
+    fn trust_needs_the_switch_and_loopback_or_zero_hops() {
+        let v4: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        let v6: SocketAddr = "[::1]:3000".parse().unwrap();
         let mut config = AutumnConfig::default();
-        config.security.trusted_proxies.trust_forwarded_headers = false;
-        config.security.trusted_proxies.ranges = vec!["127.0.0.1".to_owned()];
-        assert!(!trusts_loopback(&config));
+        let policy = &mut config.security.trusted_proxies;
+        policy.trust_forwarded_headers = false;
+        policy.ranges = vec!["127.0.0.1".to_owned()];
+        assert!(!trusts_proxy(&config, v4), "switch off");
         config.security.trusted_proxies.trust_forwarded_headers = true;
-        assert!(trusts_loopback(&config));
+        assert!(trusts_proxy(&config, v4));
+        assert!(!trusts_proxy(&config, v6), "no ::1 in the ranges");
+        config.security.trusted_proxies.ranges = vec!["10.0.0.0/8".to_owned()];
+        assert!(!trusts_proxy(&config, v4));
         config.security.trusted_proxies.ranges.clear();
-        assert!(!trusts_loopback(&config));
+        assert!(trusts_proxy(&config, v4), "empty ranges trust all peers");
         config.security.trusted_proxies.trusted_hops = Some(1);
-        assert!(trusts_loopback(&config));
+        assert!(!trusts_proxy(&config, v4), "one hop skips the client");
+        config.security.trusted_proxies.trusted_hops = Some(0);
+        assert!(trusts_proxy(&config, v4));
     }
 
     #[test]

@@ -12,8 +12,9 @@ use pingora_http::RequestHeader;
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 
 use crate::config::Route;
+use crate::forwarded::IpRange;
 use crate::metrics::{FALLBACK, Metrics, UNMATCHED};
-use crate::router::{Router, has_dot_segment, strip_prefix};
+use crate::router::{Router, strip_prefix, unsafe_path};
 use crate::upstream::Pool;
 
 /// Where a request goes.
@@ -38,9 +39,19 @@ pub struct Ctx {
     body_bytes: u64,
     /// Upstreams that failed to connect for this request.
     tried: Vec<SocketAddr>,
+    /// The status for the last connect failure.
+    connect_status: Option<u16>,
+    /// Connect retries so far.
+    connect_retries: usize,
+    /// The upstream of the current attempt.
+    peer: Option<SocketAddr>,
     /// The status sent by the proxy itself, when it sent one.
     status: u16,
 }
+
+/// Time an idle pooled upstream connection stays open. It bounds how long
+/// upstream sockets stay open after a drain.
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeouts for upstream connections.
 #[derive(Debug, Clone, Copy)]
@@ -56,8 +67,9 @@ pub struct Gateway {
     pub pools: Arc<Vec<Pool>>,
     pub router: Router,
     pub fallback: Option<SocketAddr>,
-    pub trust_forwarded: bool,
+    pub trusted: Vec<IpRange>,
     pub max_body: u64,
+    pub max_retries: usize,
     pub timeouts: Timeouts,
     pub metrics: Option<Arc<Metrics>>,
 }
@@ -85,6 +97,7 @@ impl Gateway {
         peer.options.connection_timeout = Some(self.timeouts.connect);
         peer.options.read_timeout = self.timeouts.read;
         peer.options.write_timeout = self.timeouts.write;
+        peer.options.idle_timeout = Some(UPSTREAM_IDLE_TIMEOUT);
         Box::new(peer)
     }
 }
@@ -97,7 +110,7 @@ fn client_ip(session: &Session) -> Option<IpAddr> {
         .map(SocketAddr::ip)
 }
 
-/// The `Host` header, or the URI authority (HTTP/2).
+/// The `Host` header, or the authority of an absolute-form target.
 fn request_host(header: &RequestHeader) -> Option<String> {
     header
         .headers
@@ -139,9 +152,16 @@ impl ProxyHttp for Gateway {
         Ctx::default()
     }
 
+    async fn early_request_filter(&self, session: &mut Session, _ctx: &mut Ctx) -> Result<()> {
+        // Bound slow clients on the body and the response, as upstreams are.
+        session.set_read_timeout(self.timeouts.read);
+        session.set_write_timeout(self.timeouts.write);
+        Ok(())
+    }
+
     async fn request_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<bool> {
         let header = session.req_header();
-        if has_dot_segment(header.uri.path()) {
+        if unsafe_path(header.uri.path()) {
             return reject(session, ctx, 400).await;
         }
         ctx.host = request_host(header);
@@ -162,6 +182,9 @@ impl ProxyHttp for Gateway {
     }
 
     async fn upstream_peer(&self, session: &mut Session, ctx: &mut Ctx) -> Result<Box<HttpPeer>> {
+        // Pingora sends the body again on a retry. Count it again from 0.
+        ctx.body_bytes = 0;
+        ctx.peer = None;
         match ctx.target {
             Target::Route(index) => {
                 let key = client_ip(session)
@@ -171,20 +194,30 @@ impl ProxyHttp for Gateway {
                     .pools
                     .get(index)
                     .and_then(|pool| pool.select(key.as_bytes(), &ctx.tried));
-                pick.map_or_else(
-                    || {
-                        self.count_upstream_error(ctx);
-                        Err(Error::explain(
-                            ErrorType::HTTPStatus(503),
-                            "no healthy upstream",
-                        ))
-                    },
-                    |addr| Ok(self.peer(addr)),
-                )
+                let Some(addr) = pick else {
+                    // After connect failures, report the last one. It is
+                    // counted already.
+                    if let Some(status) = ctx.connect_status {
+                        return Err(Error::explain(
+                            ErrorType::HTTPStatus(status),
+                            "no upstream left to try",
+                        ));
+                    }
+                    self.count_upstream_error(ctx);
+                    return Err(Error::explain(
+                        ErrorType::HTTPStatus(503),
+                        "no healthy upstream",
+                    ));
+                };
+                ctx.peer = Some(addr);
+                Ok(self.peer(addr))
             }
             Target::Fallback => self.fallback.map_or_else(
                 || Err(Error::explain(ErrorType::HTTPStatus(404), "no fallback")),
-                |addr| Ok(self.peer(addr)),
+                |addr| {
+                    ctx.peer = Some(addr);
+                    Ok(self.peer(addr))
+                },
             ),
             Target::Unmatched => Err(Error::explain(ErrorType::HTTPStatus(404), "no route")),
         }
@@ -192,11 +225,15 @@ impl ProxyHttp for Gateway {
 
     async fn request_body_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         body: &mut Option<Bytes>,
         _end_of_stream: bool,
         ctx: &mut Ctx,
     ) -> Result<()> {
+        // After an upgrade (WebSocket), the bytes are a stream, not a body.
+        if session.was_upgraded() {
+            return Ok(());
+        }
         if let Some(chunk) = body {
             ctx.body_bytes = ctx.body_bytes.saturating_add(chunk.len() as u64);
         }
@@ -230,32 +267,35 @@ impl ProxyHttp for Gateway {
                 .map_err(|e| Error::because(ErrorType::InternalError, "strip prefix", e))?;
             upstream.set_uri(uri);
         }
+        let client = client_ip(session);
+        let trusted = client.is_some_and(|ip| self.trusted.iter().any(|r| r.contains(ip)));
         let changes = crate::forwarded::changes(
-            client_ip(session),
+            client,
             &session.req_header().headers,
             ctx.host.as_deref(),
-            self.trust_forwarded,
+            trusted,
         );
         for (name, value) in changes {
             match value {
                 Some(value) => upstream.insert_header(name, value)?,
                 None => {
-                    upstream.remove_header(name);
+                    upstream.remove_header(&name);
                 }
             }
         }
-        match route
-            .map(|r| r.upstream_host.as_str())
-            .filter(|h| !h.is_empty())
-        {
-            Some(host) => upstream.insert_header(http::header::HOST, host)?,
-            None => {
-                if upstream.headers.get(http::header::HOST).is_none()
-                    && let Some(host) = &ctx.host
-                {
-                    upstream.insert_header(http::header::HOST, host.as_str())?;
-                }
-            }
+        let configured = route
+            .map(|r| r.upstream_host.clone())
+            .filter(|h| !h.is_empty());
+        // HTTP/1.0 clients can omit `Host`. The upstream request is
+        // HTTP/1.1, so it needs one.
+        let missing = upstream.headers.get(http::header::HOST).is_none();
+        let host = configured.or_else(|| {
+            missing
+                .then(|| ctx.host.clone().or_else(|| ctx.peer.map(|a| a.to_string())))
+                .flatten()
+        });
+        if let Some(host) = host {
+            upstream.insert_header(http::header::HOST, host)?;
         }
         Ok(())
     }
@@ -271,9 +311,17 @@ impl ProxyHttp for Gateway {
         if let Some(addr) = peer._address.as_inet() {
             ctx.tried.push(*addr);
         }
-        // No byte reached the upstream, so a retry is safe. Pingora caps
-        // the count with `max_retries`.
-        e.set_retry(true);
+        let timed_out = matches!(
+            e.etype(),
+            ErrorType::ConnectTimedout | ErrorType::TLSHandshakeTimedout
+        );
+        ctx.connect_status = Some(if timed_out { 504 } else { 502 });
+        // No byte reached the upstream, so a retry is safe.
+        let retry = ctx.connect_retries < self.max_retries;
+        if retry {
+            ctx.connect_retries += 1;
+        }
+        e.set_retry(retry);
         e
     }
 

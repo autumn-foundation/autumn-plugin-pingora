@@ -43,8 +43,26 @@ pub enum Fallback {
     /// To the Autumn app (ADR 0002).
     #[default]
     App,
-    /// Respond 404.
-    None,
+    /// Respond 404. In TOML: `"none"`.
+    #[serde(rename = "none")]
+    NotFound,
+}
+
+impl Fallback {
+    /// The name in TOML.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::App => "app",
+            Self::NotFound => "none",
+        }
+    }
+}
+
+impl fmt::Display for Fallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// How a route picks an upstream.
@@ -123,16 +141,19 @@ pub struct PingoraConfig {
     /// Where unmatched requests go: `app` (the Autumn app) or `none`
     /// (404). Default: `app`.
     pub fallback: Fallback,
-    /// Keep client `X-Forwarded-*` and `Forwarded` headers. Set this only
-    /// behind a proxy that you trust. Default: `false`.
-    pub trust_forwarded_headers: bool,
+    /// Peers (IPs or CIDR ranges) whose `X-Forwarded-*` and other identity
+    /// headers the proxy keeps. For other peers, the proxy replaces them.
+    /// Put only your own load balancers here. Default: empty.
+    pub trusted_proxies: Vec<String>,
     /// Upstream connect timeout. Must be more than `0`. Default: `5000`.
     pub connect_timeout_ms: u64,
     /// Upstream read timeout. `0`: off. Default: `60000`.
     pub read_timeout_ms: u64,
     /// Upstream write timeout. `0`: off. Default: `60000`.
     pub write_timeout_ms: u64,
-    /// Connect retries on another upstream. Default: `1`.
+    /// Connect retries on another upstream. Pingora also retries an
+    /// idempotent request once or twice when a pooled connection is stale.
+    /// Default: `1`.
     pub max_retries: usize,
     /// Upstream TCP health check interval. `0`: off. Default: `5000`.
     pub health_check_interval_ms: u64,
@@ -142,11 +163,18 @@ pub struct PingoraConfig {
     /// Largest request body. Bigger requests get 413. `0`: off.
     /// Default: `10485760` (10 MiB).
     pub max_request_body_bytes: u64,
-    /// Open client connections. The listener waits at the limit. `0`: off.
-    /// Default: `10000`.
+    /// Maximum open client connections. At the limit, the proxy stops
+    /// accepting until a connection closes. `0`: no limit. At most
+    /// `1000000`. Default: `10000`.
     pub max_connections: usize,
+    /// Maximum open connections from one client IP. The proxy closes
+    /// connections over the limit at once. Keep `0` behind a load balancer,
+    /// because all connections then have its IP. `0`: no limit.
+    /// Default: `0`.
+    pub max_connections_per_ip: usize,
     /// Time for open requests to finish at shutdown. Must be more than
-    /// `0`. Default: `10000`.
+    /// `0`. The plugin caps it to fit `server.shutdown_timeout_secs`.
+    /// Default: `10000`.
     pub shutdown_grace_ms: u64,
     /// Record `pingora_proxy_*` metrics. Default: `true`.
     pub metrics: bool,
@@ -161,7 +189,7 @@ impl Default for PingoraConfig {
             enabled: true,
             bind: String::new(),
             fallback: Fallback::App,
-            trust_forwarded_headers: false,
+            trusted_proxies: Vec::new(),
             connect_timeout_ms: 5_000,
             read_timeout_ms: 60_000,
             write_timeout_ms: 60_000,
@@ -170,6 +198,7 @@ impl Default for PingoraConfig {
             health_check_timeout_ms: 1_000,
             max_request_body_bytes: 10 * 1024 * 1024,
             max_connections: 10_000,
+            max_connections_per_ip: 0,
             shutdown_grace_ms: 10_000,
             metrics: true,
             routes: Vec::new(),
@@ -234,6 +263,9 @@ const fn millis(ms: u64) -> Option<Duration> {
         Some(Duration::from_millis(ms))
     }
 }
+
+/// Largest `max_connections`.
+pub const MAX_CONNECTIONS_LIMIT: usize = 1_000_000;
 
 /// Names that metrics use for requests with no route.
 pub const RESERVED_NAMES: [&str; 2] = ["fallback", "unmatched"];
@@ -394,6 +426,18 @@ impl PingoraConfig {
                 return Err(ConfigError(format!("`{key}` must be more than 0")));
             }
         }
+        for range in &self.trusted_proxies {
+            if crate::forwarded::IpRange::parse(range).is_none() {
+                return Err(ConfigError(format!(
+                    "`trusted_proxies` entry \"{range}\" must be an IP or a CIDR range"
+                )));
+            }
+        }
+        if self.max_connections > MAX_CONNECTIONS_LIMIT {
+            return Err(ConfigError(format!(
+                "`max_connections` must be at most {MAX_CONNECTIONS_LIMIT}"
+            )));
+        }
         let mut names = HashSet::new();
         let mut rules = HashSet::new();
         for route in &self.routes {
@@ -519,7 +563,7 @@ impl Route {
         if !prefix.starts_with('/')
             || prefix.contains(['?', '#'])
             || prefix.chars().any(|c| c.is_whitespace() || c.is_control())
-            || crate::router::has_dot_segment(prefix)
+            || crate::router::unsafe_path(prefix)
         {
             return fail(format!(
                 "`path_prefix` must start with `/` and have no query, fragment or dot segment, found \"{}\"",
@@ -529,11 +573,15 @@ impl Route {
         if self.upstreams.is_empty() {
             return fail("`upstreams` must have at least one address".to_owned());
         }
+        let mut seen = HashSet::new();
         for upstream in &self.upstreams {
             if !valid_upstream(upstream) {
                 return fail(format!(
                     "upstream \"{upstream}\" must be host:port (for example \"10.0.0.7:8080\")"
                 ));
+            }
+            if !seen.insert(upstream.to_ascii_lowercase()) {
+                return fail(format!("upstream \"{upstream}\" is in the list two times"));
             }
         }
         if http::HeaderValue::from_str(&self.upstream_host).is_err()
@@ -586,9 +634,9 @@ fn env_prefix(section: &str) -> String {
 
 /// Apply `AUTUMN_<SECTION>__<KEY>` overrides for each known key.
 ///
-/// Values are TOML literals (`true`, `10`, `"x"`, `[..]`) or bare strings.
-/// An override with the wrong type is an error: a bad value must not leave
-/// a file value in place.
+/// Each value is a TOML literal (`true`, `10`, `"x"`, `[..]`) or a bare
+/// string. A wrong type causes an error. The file value does not stay.
+/// The caller validates the result once, after all overrides.
 fn apply_env_overrides(
     section_name: &str,
     section: &mut toml::Value,
@@ -606,12 +654,18 @@ fn apply_env_overrides(
         let Some(raw) = env_trimmed(env, &key) else {
             continue;
         };
+        let mut value = parse_env_value(&raw);
+        // Enum names are lower case in TOML. Accept `App` or `NONE` too.
+        if name == "fallback"
+            && let toml::Value::String(text) = &value
+        {
+            value = toml::Value::String(text.to_ascii_lowercase());
+        }
         let mut candidate = section.clone();
         if let Some(table) = candidate.as_table_mut() {
-            table.insert(name.clone(), parse_env_value(&raw));
+            table.insert(name.clone(), value);
         }
         *config = PingoraConfig::from_section(Some(&candidate))
-            .and_then(|c| c.validate().map(|()| c))
             .map_err(|error| ConfigError(format!("{key}: {}", error.message())))?;
         *section = candidate;
     }

@@ -66,7 +66,7 @@ Each answer gives a countermeasure.
 | A bad upstream address shows only at the first request. | Parse every upstream at boot. Hostnames resolve at boot. |
 | `/api` matches `/apix`. Traffic goes to the wrong service. | Match prefixes on a segment boundary. Property tests. |
 | Two routes have the same name. Metrics mix. | Route names must be unique. Boot stops. |
-| A client sends `X-Forwarded-For: 1.2.3.4`. The upstream trusts it. | Replace client `X-Forwarded-*` values. Keep them only with `trust_forwarded_headers = true`. |
+| A client sends `X-Forwarded-For: 1.2.3.4`. The upstream trusts it. | Replace client `X-Forwarded-*` values. Keep them only from peers in `trusted_proxies` (ADR 0004). |
 | The Autumn app sees `127.0.0.1` for every client. Rate limits break. | Warn at boot when the app does not trust the loopback proxy. |
 | Fallback to the app while Autumn serves TLS. The proxy speaks plain HTTP to a TLS port. | Boot stops with a clear error. |
 | The proxy bind address is the app address. Requests loop. | Boot stops with a clear error. |
@@ -80,8 +80,27 @@ Each answer gives a countermeasure.
 | Health says UP while the proxy drains. The load balancer sends new traffic. | Indicator is in the readiness group. `DOWN` when not serving. |
 | Attacker sends random paths. Metric labels explode. | Labels are route names from config, `fallback`, `unmatched`, and status classes. |
 | Metric names start with `autumn_`. Autumn drops them. | Use the `pingora_proxy_` prefix. |
-| `unwrap` or `panic!` in library code. | Clippy denies them. CI makes warnings errors. |
+| `unwrap` or `panic!` in library code. | Clippy warns on them. CI makes warnings errors. |
 | Invalid lifecycle order (serve after stop). | A pure state machine owns the lifecycle. A test checks every transition. |
+
+Found in review (five reviewers: correctness, security, concurrency,
+API and docs, tests):
+
+| How to fail | Countermeasure |
+|---|---|
+| The serve task dies with its runtime. `shutdown()` waits forever. | A drop guard records `ServerExited`. |
+| A second startup hook marks the proxy done while it serves. | `fail()` changes nothing when the proxy serves. |
+| Retries use up the pool. The client gets 503, not 502/504. | Keep the last connect status. Count the failure one time. |
+| Retry sends the body again. The body limit counts it two times. | Reset the count for each attempt. |
+| WebSocket bytes count against the body limit. | Do not count after an upgrade. |
+| HTTP/1.0 without `Host` goes upstream as HTTP/1.1 without `Host`. | Use the upstream address as `Host`. |
+| Pooled upstream sockets stay open after the drain. | A 30 s idle timeout. |
+| `/api/..;/admin`, `..%2f` or `..\` escapes a route prefix. | Decode two times, remove `;params`, reject dot segments and backslashes. |
+| `X-Real-IP` and other identity headers pass through. | Remove them from untrusted peers. |
+| `trust_forwarded_headers = true` trusts every client. | Replace it with a `trusted_proxies` peer list. |
+| One client opens 10 000 slow connections. | `max_connections_per_ip`, and client read/write timeouts. |
+| `max_connections = usize::MAX` panics at boot. | At most 1 000 000. |
+| A host-less `/billing` route takes `api.example.com/billing`. | The host decides first, as in nginx. |
 
 ## 4. Six thinking hats
 
@@ -101,7 +120,8 @@ surprise: an unmatched request reaches the app as before. Operators must
 trust the health signal and the metrics.
 
 **Black (risks).**
-Pingora is pre-1.0; its API changes. It pulls many crates (compile time).
+Pingora is pre-1.0. Its API changes. It adds many dependencies. Compile
+time increases.
 The config loader copies core logic and can drift. Two ports need two
 firewall rules. No TLS in v0.1, so the proxy must sit behind a TLS
 terminator or on a private network.
@@ -136,12 +156,12 @@ Decisions:
 | ID | Criterion |
 |---|---|
 | AC1 | `PingoraPlugin::new().route(..)` runs a Pingora reverse proxy on a dedicated listener. An empty `bind` gives `127.0.0.1:8080` in `dev`/`test` and `0.0.0.0:8080` in other profiles. |
-| AC2 | Configuration comes from `[pingora]` in `autumn.toml`, with profile layering and `AUTUMN_PINGORA__*` env overrides for scalar keys. Code applies on top. Invalid configuration aborts boot with a clear message. |
-| AC3 | Routing: host (exact or `*.` wildcard) and path prefix on a segment boundary. The longest prefix wins. A host route wins over an any-host route. `strip_prefix` removes the prefix. Unmatched requests go to the Autumn app (`fallback = "app"`) or get 404 (`fallback = "none"`). |
+| AC2 | Configuration comes from `[pingora]` in `autumn.toml`, with profile layering and `AUTUMN_PINGORA__*` env overrides for each top-level key (`ROUTES` takes a TOML array). Code applies on top. Invalid configuration aborts boot with a clear message. |
+| AC3 | Routing: host (exact or `*.` wildcard) and path prefix on a segment boundary. The host decides first (exact, then wildcard, then any host). Then the longest prefix wins. `strip_prefix` removes the prefix. Unmatched requests go to the Autumn app (`fallback = "app"`) or get 404 (`fallback = "none"`). |
 | AC4 | Each route has a pool with `round_robin` (default) or `consistent` (client IP) selection. TCP health checks run on an interval. No healthy upstream gives 503. |
-| AC5 | A connect failure retries on another upstream, up to `max_retries`. Connect, read and write timeouts apply. |
-| AC6 | The proxy sets `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host`. It replaces client values unless `trust_forwarded_headers = true`. It keeps the client `Host` unless the route sets `upstream_host`. |
-| AC7 | `max_request_body_bytes` gives 413. `max_connections` limits open connections. |
+| AC5 | A connect failure retries on another upstream, up to `max_retries`. A failed connect gives 502, an upstream timeout 504. Connect, read and write timeouts apply. |
+| AC6 | The proxy sets `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host`. It replaces client values and removes other identity headers, except from peers in `trusted_proxies`. It keeps the client `Host` unless the route sets `upstream_host`. Unsafe paths get 400. |
+| AC7 | `max_request_body_bytes` gives 413. `max_connections` and `max_connections_per_ip` limit open connections. |
 | AC8 | The plugin reports to Autumn: a `pingora` readiness indicator (UP only while serving) and `pingora_proxy_*` metrics with bounded labels. A `PingoraHandle` is in `AppState`. |
 | AC9 | A pure lifecycle state machine has all transitions tested. A bind failure aborts boot. Shutdown starts on Autumn's shutdown signal or the hook: stop accepting, end keep-alive, drain for `shutdown_grace_ms`, then abort. Shutdown is idempotent. |
 | AC10 | Boot stops when the fallback target uses TLS or when the proxy address is the app address. Boot warns when the app does not trust the loopback proxy. |
@@ -153,7 +173,7 @@ Decisions:
 ```mermaid
 flowchart LR
   C[Client] --> L[Accept loop]
-  L --> P[HttpProxy + GatewayProxy]
+  L --> P[HttpProxy + Gateway]
   P -->|route match| R[Router]
   R -->|pool| U1[(Upstream pool)]
   R -->|fallback| A[Autumn app]
@@ -169,7 +189,7 @@ Modules:
 - `router` — pure route match and prefix strip.
 - `forwarded` — pure `X-Forwarded-*` rules.
 - `upstream` — pools, selection, health checks.
-- `proxy` — the `ProxyHttp` implementation.
+- `proxy` — the `ProxyHttp` implementation (`Gateway`).
 - `server` — accept loop, connection limit, drain, `PingoraHandle`.
 - `metrics`, `health` — actuator parts.
 - `plugin` — the builder and the Autumn `Plugin` implementation.

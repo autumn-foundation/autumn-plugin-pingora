@@ -6,7 +6,7 @@ mod common;
 
 use autumn_web::config::AutumnConfig;
 use autumn_web::test::TestApp;
-use common::{boot_with, dead_address, eventually, get, plugin, route, upstream};
+use common::{boot_with, dead, eventually, get, has_line, plugin, route, upstream};
 
 fn detailed() -> TestApp {
     let mut config = AutumnConfig::default();
@@ -45,6 +45,7 @@ async fn health_is_up_while_serving_and_down_after_shutdown() {
 #[tokio::test(flavor = "multi_thread")]
 async fn metrics_count_requests_by_route_and_status_class() {
     let a = upstream("a").await;
+    let dead = dead();
     let (http, handle) = boot_with(
         TestApp::new(),
         plugin()
@@ -52,7 +53,7 @@ async fn metrics_count_requests_by_route_and_status_class() {
             .route(
                 autumn_plugin_pingora::Route::new("dead")
                     .path_prefix("/dead")
-                    .upstream(dead_address()),
+                    .upstream(dead.address()),
             ),
     );
     get(&handle, "/a/1").await;
@@ -63,7 +64,7 @@ async fn metrics_count_requests_by_route_and_status_class() {
     assert!(
         eventually(move || {
             let probe = probe.clone();
-            async move { probe.upstream_health().contains(&("dead".to_owned(), 0, 1)) }
+            async move { common::health(&probe).contains(&("dead".to_owned(), 0, 1)) }
         })
         .await
     );
@@ -81,7 +82,7 @@ async fn metrics_count_requests_by_route_and_status_class() {
         r#"pingora_proxy_upstreams{route="a"} 1"#,
         "pingora_proxy_up 1",
     ] {
-        assert!(text.contains(line), "missing `{line}` in:\n{text}");
+        assert!(has_line(&text, line), "missing `{line}` in:\n{text}");
     }
     assert!(text.contains("pingora_proxy_connections_active"), "{text}");
     handle.shutdown().await;

@@ -27,7 +27,13 @@ Pingora reverse proxy plugin for Autumn 0.7, on Pingora 0.9. One crate.
 - **State changes only through `LifecycleCell::apply`.** Change the spec
   table in `tests/lifecycle.rs` first.
 - **Drain work runs in a spawned task**, not in the caller (ADR 0003).
-- **Pingora `max_retries` counts attempts.** Set it to retries + 1.
+- **Pingora `max_retries` counts all attempts.** Connect retries are
+  capped in `fail_to_connect`; `ServerConf.max_retries` adds room for
+  stale-connection retries.
+- **Trust forwarded headers by peer only** (`trusted_proxies`, ADR 0004).
+  Never add a switch that trusts all clients.
+- **Paths:** `router::unsafe_path` guards every request. Add a test case
+  for each new bypass.
 - **Metric labels stay bounded:** route names, `fallback`, `unmatched`,
   status classes. Names start with `pingora_proxy_`, never `autumn_`.
 - **Config:** a new key goes in `config.rs` with a safe default, a doc

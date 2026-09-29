@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use autumn_web::actuator::{MetricFamily, MetricKind, MetricSample, MetricsSource};
 
-use crate::server::Shared;
+use crate::server::{Shared, UpstreamHealth};
 
 /// Label for requests that go to the Autumn app.
 pub const FALLBACK: &str = "fallback";
@@ -121,10 +121,10 @@ pub fn families(shared: &Shared) -> Vec<MetricFamily> {
     let up = u64::from(shared.lifecycle.get().is_ready());
     let active = shared.active_connections() as u64;
     let health = shared.upstream_health();
-    let per_route = |pick: fn(&(String, usize, usize)) -> usize| {
+    let per_route = |pick: fn(&UpstreamHealth) -> usize| {
         health
             .iter()
-            .map(|entry| sample(vec![("route", entry.0.clone())], pick(entry) as u64))
+            .map(|entry| sample(vec![("route", entry.route.clone())], pick(entry) as u64))
             .collect()
     };
     let mut out = vec![
@@ -144,13 +144,13 @@ pub fn families(shared: &Shared) -> Vec<MetricFamily> {
             "pingora_proxy_upstreams_healthy",
             "Healthy upstreams by route.",
             MetricKind::Gauge,
-            per_route(|e| e.1),
+            per_route(|e| e.healthy),
         ),
         family(
             "pingora_proxy_upstreams",
             "Upstreams by route.",
             MetricKind::Gauge,
-            per_route(|e| e.2),
+            per_route(|e| e.total),
         ),
     ];
     if let Some(metrics) = shared.metrics.get() {

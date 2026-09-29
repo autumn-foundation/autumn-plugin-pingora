@@ -13,8 +13,10 @@ the shutdown order.
 
 Do not use Pingora's `Server` or listening `Service`. Bind a
 `tokio::net::TcpListener` in the Autumn startup hook. Accept on Autumn's
-tokio runtime. Give each connection to `pingora_proxy::http_proxy` as a
-`pingora_core` `Stream`. Track each connection task in a `JoinSet`.
+tokio runtime. Make one `HttpProxy` with `pingora_proxy::http_proxy`.
+Give each connection to `HttpProxy::process_new` as a `pingora_core`
+`Stream`. Track each connection task in a `JoinSet`. A drop guard in the
+serve task records `ServerExited` when the task ends early.
 
 ## Consequences
 

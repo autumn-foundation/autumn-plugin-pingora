@@ -97,14 +97,14 @@ proptest! {
         }
     }
 
-    /// Two threads that race one event: exactly one wins.
+    /// Threads that race one event: exactly one wins.
     #[test]
-    fn one_winner_for_a_race(_seed in 0u8..8) {
+    fn one_winner_for_a_race(threads in 2usize..8) {
         let cell = std::sync::Arc::new(LifecycleCell::new());
         let _ = cell.apply(Bound);
-        // Spawn both threads before the first join.
+        // Spawn all threads before the first join.
         #[allow(clippy::needless_collect)]
-        let handles: Vec<_> = (0..2)
+        let handles: Vec<_> = (0..threads)
             .map(|_| {
                 let cell = cell.clone();
                 std::thread::spawn(move || cell.apply(ShutdownRequested).is_ok())

@@ -21,9 +21,8 @@ async fn index() -> &'static str {
 
 /// A second service, as a stand-in for a real upstream.
 async fn billing_service() {
-    let app = axum::Router::new().fallback(|uri: axum::http::Uri| async move {
-        format!("billing service: {uri}\n")
-    });
+    let app = axum::Router::new()
+        .fallback(|uri: axum::http::Uri| async move { format!("billing service: {uri}\n") });
     match tokio::net::TcpListener::bind("127.0.0.1:7001").await {
         Ok(listener) => {
             let _ = axum::serve(listener, app).await;

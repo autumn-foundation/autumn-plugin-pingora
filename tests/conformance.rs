@@ -96,7 +96,7 @@ fn the_fallback_is_not_declared() {
 fn builders_change_the_effective_config() {
     let plugin = common::plugin()
         .bind("127.0.0.1:7777")
-        .fallback(Fallback::None)
+        .fallback(Fallback::NotFound)
         .route(Route::new("a").upstream("127.0.0.1:1"));
     let config = plugin.effective_config().unwrap();
     assert_eq!(config.bind, "127.0.0.1:7777");

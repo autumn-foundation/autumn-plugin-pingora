@@ -104,7 +104,7 @@ async fn echo(name: &'static str, request: Request) -> axum::Json<Value> {
 pub fn local_config() -> PingoraConfig {
     let mut config = PingoraConfig::default();
     "127.0.0.1:0".clone_into(&mut config.bind);
-    config.fallback = Fallback::None;
+    config.fallback = Fallback::NotFound;
     config.shutdown_grace_ms = 2_000;
     config.health_check_interval_ms = 100;
     config.health_check_timeout_ms = 200;
@@ -208,10 +208,55 @@ where
     false
 }
 
-/// A free local port with nothing on it.
-pub fn dead_address() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr.to_string()
+/// A local port that refuses connections. The socket is bound but does
+/// not listen, so no other test can take the port while it lives.
+pub struct Dead {
+    addr: SocketAddr,
+    _socket: socket2::Socket,
+}
+
+impl Dead {
+    /// `host:port` of the dead port.
+    pub fn address(&self) -> String {
+        self.addr.to_string()
+    }
+}
+
+/// A reserved local port that refuses connections.
+pub fn dead() -> Dead {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    socket.bind(&any.into()).unwrap();
+    let addr = socket.local_addr().unwrap().as_socket().unwrap();
+    Dead {
+        addr,
+        _socket: socket,
+    }
+}
+
+/// `true` when `text` has `line` as a whole line.
+pub fn has_line(text: &str, line: &str) -> bool {
+    text.lines().any(|l| l == line)
+}
+
+/// Upstream health as `(route, healthy, total)` tuples.
+pub fn health(handle: &PingoraHandle) -> Vec<(String, usize, usize)> {
+    handle
+        .upstream_health()
+        .into_iter()
+        .map(|h| (h.route, h.healthy, h.total))
+        .collect()
+}
+
+/// Write `request` on a new connection to the proxy and read until the
+/// server closes the connection (at most 5 s).
+pub async fn raw(handle: &PingoraHandle, request: &[u8]) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(handle.local_addr().unwrap())
+        .await
+        .unwrap();
+    stream.write_all(request).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
+    String::from_utf8_lossy(&buf).into_owned()
 }

@@ -1,16 +1,69 @@
-//! `X-Forwarded-*` rules. Pure functions.
+//! `X-Forwarded-*` rules and IP ranges. Pure functions.
 
 use std::net::IpAddr;
 
 use http::HeaderMap;
 
 /// A header change: set a value, or remove the header (`None`).
-pub type Change = (&'static str, Option<String>);
+pub type Change = (String, Option<String>);
 
-/// The forwarded headers for the upstream request.
+/// Client identity headers that some servers trust. Without trust, the
+/// proxy removes them. It also removes all other `x-forwarded-*` headers.
+const IDENTITY_HEADERS: [&str; 7] = [
+    "forwarded",
+    "x-real-ip",
+    "true-client-ip",
+    "x-client-ip",
+    "cf-connecting-ip",
+    "x-cluster-client-ip",
+    "x-original-forwarded-for",
+];
+
+/// The three headers that the proxy sets.
+const SET: [&str; 3] = ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host"];
+
+/// An IP address or a CIDR range, for example `10.0.0.0/8`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpRange {
+    base: IpAddr,
+    bits: u32,
+}
+
+impl IpRange {
+    /// Parse `10.0.0.1`, `10.0.0.0/8`, `::1` or `fd00::/8`.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        let (base, bits) = match text.split_once('/') {
+            Some((base, bits)) => (base, Some(bits.parse::<u32>().ok()?)),
+            None => (text, None),
+        };
+        let base = base.parse::<IpAddr>().ok()?;
+        let width = if base.is_ipv4() { 32 } else { 128 };
+        let bits = bits.unwrap_or(width);
+        (bits <= width).then_some(Self { base, bits })
+    }
+
+    /// `true` when `ip` is in the range.
+    #[must_use]
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let (base, ip, width) = match (self.base, ip) {
+            (IpAddr::V4(base), IpAddr::V4(ip)) => {
+                (u128::from(u32::from(base)), u128::from(u32::from(ip)), 32)
+            }
+            (IpAddr::V6(base), IpAddr::V6(ip)) => (u128::from(base), u128::from(ip), 128),
+            _ => return false,
+        };
+        let shift = width - self.bits;
+        base.checked_shr(shift).unwrap_or(0) == ip.checked_shr(shift).unwrap_or(0)
+    }
+}
+
+/// The header changes for the upstream request.
 ///
-/// Without `trust`, the proxy replaces client values: a client must not
-/// choose the address that the upstream sees.
+/// Without `trust`, the proxy replaces the client values and removes other
+/// identity headers. A client must not choose the address that the
+/// upstream sees.
 #[must_use]
 pub fn changes(
     client: Option<IpAddr>,
@@ -26,13 +79,24 @@ pub fn changes(
     };
     let proto = kept("x-forwarded-proto").unwrap_or_else(|| "http".to_owned());
     let forwarded_host = kept("x-forwarded-host").or_else(|| host.map(str::to_owned));
-    let mut out = vec![
-        ("x-forwarded-for", for_value),
-        ("x-forwarded-proto", Some(proto)),
-        ("x-forwarded-host", forwarded_host),
-    ];
+    let mut out: Vec<Change> = SET
+        .iter()
+        .map(|name| (*name).to_owned())
+        .zip([for_value, Some(proto), forwarded_host])
+        .collect();
     if !trust {
-        out.push(("forwarded", None));
+        let others = incoming
+            .keys()
+            .map(http::HeaderName::as_str)
+            .filter(|name| name.starts_with("x-forwarded-") && !SET.contains(name));
+        let mut removed: Vec<String> = IDENTITY_HEADERS
+            .iter()
+            .copied()
+            .chain(others)
+            .map(str::to_owned)
+            .collect();
+        removed.dedup();
+        out.extend(removed.into_iter().map(|name| (name, None)));
     }
     out
 }
@@ -59,7 +123,7 @@ mod tests {
     fn get<'a>(changes: &'a [Change], name: &str) -> Option<Option<&'a str>> {
         changes
             .iter()
-            .find(|(n, _)| *n == name)
+            .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_deref())
     }
 
@@ -86,6 +150,52 @@ mod tests {
         assert_eq!(get(&out, "x-forwarded-proto"), Some(Some("http")));
         assert_eq!(get(&out, "x-forwarded-host"), Some(Some("shop.example")));
         assert_eq!(get(&out, "forwarded"), Some(None), "removed");
+    }
+
+    #[test]
+    fn untrusted_identity_headers_are_removed() {
+        let incoming = headers(&[
+            ("x-real-ip", "10.0.0.1"),
+            ("true-client-ip", "10.0.0.1"),
+            ("x-forwarded-port", "443"),
+            ("x-forwarded-prefix", "/admin"),
+            ("x-forwarded-ssl", "on"),
+        ]);
+        let out = changes(CLIENT, &incoming, None, false);
+        for name in [
+            "x-real-ip",
+            "true-client-ip",
+            "x-forwarded-port",
+            "x-forwarded-prefix",
+            "x-forwarded-ssl",
+            "cf-connecting-ip",
+        ] {
+            assert_eq!(get(&out, name), Some(None), "{name}");
+        }
+        let trusted = changes(CLIENT, &incoming, None, true);
+        assert_eq!(get(&trusted, "x-real-ip"), None, "kept when trusted");
+    }
+
+    #[test]
+    fn ranges_contain_addresses() {
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        for range in ["127.0.0.1", "127.0.0.0/8", "0.0.0.0/0", " 127.0.0.1/32 "] {
+            assert!(IpRange::parse(range).unwrap().contains(lo), "{range}");
+        }
+        for range in ["10.0.0.0/8", "127.0.0.2", "::1"] {
+            assert!(!IpRange::parse(range).unwrap().contains(lo), "{range}");
+        }
+        for bad in ["junk", "127.0.0.0/40", "::/129", "10.0.0.0/x", ""] {
+            assert!(IpRange::parse(bad).is_none(), "{bad}");
+        }
+        let v6: IpAddr = "::1".parse().unwrap();
+        assert!(IpRange::parse("::/0").unwrap().contains(v6));
+        assert!(IpRange::parse("::1/128").unwrap().contains(v6));
+        assert!(
+            IpRange::parse("fd00::/8")
+                .unwrap()
+                .contains("fd12::1".parse().unwrap())
+        );
     }
 
     #[test]

@@ -51,7 +51,8 @@ fn defaults_are_safe() {
     );
     assert_eq!(config.bind_addr(false).unwrap().to_string(), "0.0.0.0:8080");
     assert_eq!(config.fallback, Fallback::App);
-    assert!(!config.trust_forwarded_headers);
+    assert!(config.trusted_proxies.is_empty());
+    assert_eq!(config.max_connections_per_ip, 0);
     assert!(config.connect_timeout_ms > 0);
     assert!(config.read_timeout_ms > 0);
     assert!(config.write_timeout_ms > 0);
@@ -68,7 +69,7 @@ fn reads_the_section_and_routes_from_toml() {
         [pingora]
         bind = "127.0.0.1:9000"
         fallback = "none"
-        trust_forwarded_headers = true
+        trusted_proxies = ["10.0.0.0/8", "::1"]
         connect_timeout_ms = 250
         max_retries = 3
 
@@ -87,8 +88,8 @@ fn reads_the_section_and_routes_from_toml() {
     "#;
     let config = PingoraConfig::from_toml_str(text, "pingora").unwrap();
     assert_eq!(config.bind, "127.0.0.1:9000");
-    assert_eq!(config.fallback, Fallback::None);
-    assert!(config.trust_forwarded_headers);
+    assert_eq!(config.fallback, Fallback::NotFound);
+    assert_eq!(config.trusted_proxies, ["10.0.0.0/8", "::1"]);
     assert_eq!(config.connect_timeout_ms, 250);
     assert_eq!(config.max_retries, 3);
     assert_eq!(config.routes.len(), 2);
@@ -134,6 +135,11 @@ fn bad_scalar_values_are_rejected() {
             "health_check_timeout_ms",
         ),
         ("[pingora]\nfallback = \"maybe\"", "fallback"),
+        ("[pingora]\nmax_connections = 1000001", "max_connections"),
+        (
+            "[pingora]\ntrusted_proxies = [\"10.0.0.0/33\"]",
+            "trusted_proxies",
+        ),
     ] {
         let error = PingoraConfig::from_toml_str(text, "pingora").unwrap_err();
         assert!(error.to_string().contains(needle), "{text}: {error}");
@@ -154,6 +160,10 @@ fn bad_routes_are_rejected() {
         (route("a", "/a", "127.0.0.1:notaport"), "upstream"),
         (route("a", "/a", ":80"), "upstream"),
         (route("a", "/a", "http://127.0.0.1:80"), "upstream"),
+        (
+            route("a", "/a", "127.0.0.1:1").upstream("127.0.0.1:1"),
+            "two times",
+        ),
         (
             edit(route("a", "/a", "127.0.0.1:1"), |r| {
                 r.upstreams = Vec::new();
@@ -247,7 +257,7 @@ fn files_profiles_and_env_merge_in_order() {
     let env = env_for(&dir)
         .with("AUTUMN_ENV", "prod")
         .with("AUTUMN_PINGORA__WRITE_TIMEOUT_MS", "400")
-        .with("AUTUMN_PINGORA__FALLBACK", "none");
+        .with("AUTUMN_PINGORA__FALLBACK", "NONE");
     let resolved = PingoraConfig::resolve_with_env("pingora", &env).unwrap();
     let config = resolved.config();
     assert_eq!(resolved.profile(), "prod");
@@ -256,7 +266,7 @@ fn files_profiles_and_env_merge_in_order() {
     assert_eq!(config.connect_timeout_ms, 200, "inline profile");
     assert_eq!(config.read_timeout_ms, 300, "profile file");
     assert_eq!(config.write_timeout_ms, 400, "env");
-    assert_eq!(config.fallback, Fallback::None, "env enum");
+    assert_eq!(config.fallback, Fallback::NotFound, "env enum");
 }
 
 #[test]
@@ -275,19 +285,26 @@ fn env_can_replace_the_routes() {
 #[test]
 fn bad_env_values_are_errors() {
     let dir = temp_dir("bad-env");
-    for (key, value) in [
-        ("AUTUMN_PINGORA__CONNECT_TIMEOUT_MS", "soon"),
-        ("AUTUMN_PINGORA__CONNECT_TIMEOUT_MS", "0"),
-        ("AUTUMN_PINGORA__FALLBACK", "maybe"),
+    for (key, value, needle) in [
+        (
+            "AUTUMN_PINGORA__CONNECT_TIMEOUT_MS",
+            "soon",
+            "AUTUMN_PINGORA__CONNECT_TIMEOUT_MS",
+        ),
+        (
+            "AUTUMN_PINGORA__CONNECT_TIMEOUT_MS",
+            "0",
+            "must be more than 0",
+        ),
+        (
+            "AUTUMN_PINGORA__FALLBACK",
+            "maybe",
+            "AUTUMN_PINGORA__FALLBACK",
+        ),
     ] {
         let env = env_for(&dir).with(key, value);
         let error = PingoraConfig::resolve_with_env("pingora", &env).unwrap_err();
-        assert!(
-            error.message().contains("CONNECT_TIMEOUT_MS")
-                || error.message().contains("connect_timeout_ms")
-                || error.message().contains("FALLBACK"),
-            "{key}={value}: {error}"
-        );
+        assert!(error.message().contains(needle), "{key}={value}: {error}");
     }
 }
 

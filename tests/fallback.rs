@@ -65,3 +65,15 @@ async fn a_proxy_on_the_app_address_aborts_boot() {
     let message = common::boot_error(move || TestApp::new().config(config), plugin);
     assert!(message.contains("loop"), "{message}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fallback_to_a_tls_app_aborts_boot() {
+    let mut config = AutumnConfig::default();
+    config.server.tls =
+        Some(toml::from_str("cert_path = \"c.pem\"\nkey_path = \"k.pem\"").unwrap());
+    let plugin = plugin().fallback(Fallback::App);
+    let handle = plugin.handle();
+    let message = common::boot_error(move || TestApp::new().config(config), plugin);
+    assert!(message.contains("[server.tls]"), "{message}");
+    assert_eq!(handle.state(), autumn_plugin_pingora::Lifecycle::Failed);
+}

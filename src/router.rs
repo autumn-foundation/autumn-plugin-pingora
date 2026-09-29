@@ -4,8 +4,9 @@ use crate::config::{Route, normalize_prefix};
 
 /// Finds the route for a request.
 ///
-/// The longest path prefix wins. At the same prefix, an exact host wins
-/// over a wildcard host, and a host wins over no host.
+/// The host decides first, as in nginx: an exact host, then the longest
+/// wildcard, then routes with no host. In that group, the longest path
+/// prefix wins. When no prefix matches, the next group applies.
 #[derive(Debug, Clone, Default)]
 pub struct Router {
     entries: Vec<Entry>,
@@ -75,10 +76,10 @@ impl Router {
             })
             .collect();
         entries.sort_by(|a, b| {
-            b.prefix
-                .len()
-                .cmp(&a.prefix.len())
-                .then_with(|| b.host.rank().cmp(&a.host.rank()))
+            b.host
+                .rank()
+                .cmp(&a.host.rank())
+                .then_with(|| b.prefix.len().cmp(&a.prefix.len()))
                 .then_with(|| a.index.cmp(&b.index))
         });
         Self { entries }
@@ -118,14 +119,44 @@ fn prefix_matches(prefix: &str, path: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-/// `true` when `path` has a `.` or `..` segment, also percent-encoded.
+/// `true` when `path` can escape a route prefix on some upstream server.
+///
+/// The check decodes percent escapes two times (`%252e` becomes `.`). It
+/// splits on `/` and removes `;params`. A path is unsafe when a
+/// segment is `.` or `..`, or when it has a backslash or a NUL.
 #[must_use]
-pub fn has_dot_segment(path: &str) -> bool {
+pub fn unsafe_path(path: &str) -> bool {
     let path = path.split('?').next().unwrap_or(path);
-    path.split('/').any(|segment| {
-        let decoded = segment.replace("%2e", ".").replace("%2E", ".");
-        decoded == "." || decoded == ".."
+    let decoded = percent_decode(&percent_decode(path));
+    if decoded.contains(['\\', '\0']) || path.contains('\\') {
+        return true;
+    }
+    decoded.split('/').any(|segment| {
+        let segment = segment.split(';').next().unwrap_or(segment);
+        segment == "." || segment == ".."
     })
+}
+
+/// Decode `%XX` escapes. Bad escapes stay as they are.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escape = bytes
+            .get(index + 1..index + 3)
+            .filter(|_| bytes[index] == b'%')
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        if let Some(byte) = escape {
+            out.push(byte);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The request target after the route prefix is removed. The query stays.
@@ -224,10 +255,22 @@ mod tests {
     }
 
     #[test]
-    fn a_longer_prefix_wins_over_a_host() {
-        let table = Table::new(vec![route("host", "a.com", "/"), route("deep", "", "/x/y")]);
-        assert_eq!(table.pick(Some("a.com"), "/x/y/z"), "deep");
-        assert_eq!(table.pick(Some("a.com"), "/x"), "host");
+    fn a_host_route_wins_over_a_longer_any_host_prefix() {
+        let table = Table::new(vec![
+            route("host", "a.com", "/"),
+            route("host-api", "a.com", "/api"),
+            route("deep", "", "/x/y"),
+        ]);
+        assert_eq!(table.pick(Some("a.com"), "/x/y/z"), "host");
+        assert_eq!(table.pick(Some("a.com"), "/api/1"), "host-api");
+        assert_eq!(table.pick(Some("b.com"), "/x/y/z"), "deep");
+    }
+
+    #[test]
+    fn a_host_route_falls_through_when_no_prefix_matches() {
+        let table = Table::new(vec![route("host", "a.com", "/v1"), route("any", "", "/")]);
+        assert_eq!(table.pick(Some("a.com"), "/v1/x"), "host");
+        assert_eq!(table.pick(Some("a.com"), "/other"), "any");
     }
 
     #[test]
@@ -262,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn dot_segments_are_found() {
+    fn unsafe_paths_are_found() {
         for path in [
             "/a/../b",
             "/..",
@@ -272,11 +315,30 @@ mod tests {
             "/a/%2E./b",
             "/a/.%2e",
             "/a/..",
+            "/a/..;/b",
+            "/a/..;x=1/b",
+            "/a/..%2fb",
+            "/a/%2e%2e%2fb",
+            "/a/%252e%252e/b",
+            "/a/..\\b",
+            "/a/%5c..",
+            "/a/%00",
         ] {
-            assert!(has_dot_segment(path), "{path}");
+            assert!(unsafe_path(path), "{path}");
         }
-        for path in ["/", "/a/b", "/a..b", "/.well-known/x", "/a/...", "/a/b.c"] {
-            assert!(!has_dot_segment(path), "{path}");
+        for path in [
+            "/",
+            "/a/b",
+            "/a..b",
+            "/.well-known/x",
+            "/a/...",
+            "/a/b.c",
+            "/files/a%2Fb",
+            "/a;v=1/b",
+            "/100%",
+            "/a?x=/../",
+        ] {
+            assert!(!unsafe_path(path), "{path}");
         }
     }
 

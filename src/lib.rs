@@ -16,9 +16,10 @@
 //! }
 //! ```
 //!
-//! The proxy has its own listener (default `127.0.0.1:8080` in dev,
-//! `0.0.0.0:8080` in other profiles). It sends matched requests to the
-//! route's upstream pool and all other requests to the Autumn app. It adds:
+//! The proxy has its own listener. The default is `127.0.0.1:8080` in
+//! `dev` and `test`, and `0.0.0.0:8080` in other profiles. The proxy sends
+//! matched requests to the route's upstream pool. It sends all other
+//! requests to the Autumn app. It adds:
 //!
 //! - round-robin or consistent-hash load balancing,
 //! - TCP health checks and connect retries,
@@ -45,9 +46,10 @@ mod server;
 mod upstream;
 
 pub use config::{
-    ConfigError, DEFAULT_PORT, DEFAULT_SECTION, Fallback, PingoraConfig, Resolved, Route, Selection,
+    ConfigError, DEFAULT_PORT, DEFAULT_SECTION, Fallback, MAX_CONNECTIONS_LIMIT, PingoraConfig,
+    Resolved, Route, Selection,
 };
 pub use error::PingoraError;
 pub use lifecycle::{Lifecycle, LifecycleCell, LifecycleEvent};
-pub use plugin::{PLUGIN_NAME, PingoraPlugin, SUPPORTED_AUTUMN_WEB};
-pub use server::PingoraHandle;
+pub use plugin::{PLUGIN_NAME, PingoraPlugin};
+pub use server::{PingoraHandle, UpstreamHealth};

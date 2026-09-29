@@ -8,9 +8,9 @@ use futures_util::future::BoxFuture;
 
 use crate::server::Shared;
 
-/// `UP` while the proxy serves, else `DOWN`. It is in the readiness
-/// group, so a draining instance leaves the load balancer. An upstream
-/// outage does not make it `DOWN`: the details show it.
+/// The status is `UP` when the proxy serves, else `DOWN`. The indicator
+/// is in the readiness group. Thus a draining instance gets no new
+/// traffic. Upstream failures show only in the details.
 pub struct ProxyHealth(pub Arc<Shared>);
 
 impl HealthIndicator for ProxyHealth {
@@ -26,8 +26,11 @@ impl HealthIndicator for ProxyHealth {
                 .0
                 .upstream_health()
                 .into_iter()
-                .map(|(name, healthy, total)| {
-                    (name, serde_json::json!(format!("{healthy}/{total}")))
+                .map(|h| {
+                    (
+                        h.route,
+                        serde_json::json!(format!("{}/{}", h.healthy, h.total)),
+                    )
                 })
                 .collect();
             if !routes.is_empty() {

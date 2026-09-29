@@ -1,11 +1,13 @@
 //! The accept loop, the drain and [`PingoraHandle`] (ADR 0001, ADR 0003).
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use pingora_core::apps::{HttpServerApp, ServerApp};
+use pingora_core::protocols::GetSocketDigest;
 use pingora_core::protocols::l4::listener::Listener;
 use pingora_core::protocols::l4::stream::Stream;
 use pingora_proxy::HttpProxy;
@@ -13,13 +15,27 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::error::PingoraError;
 use crate::lifecycle::{Lifecycle, LifecycleCell, LifecycleEvent};
 use crate::metrics::Metrics;
 use crate::proxy::Gateway;
 use crate::upstream::Pool;
 
-/// Pause after an `accept` error, so a full fd table does not spin.
+/// Wait after an `accept` error. Then a full fd table does not use all
+/// the CPU.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Upstream health for one route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UpstreamHealth {
+    /// The route name.
+    pub route: String,
+    /// Upstreams that passed the last health check.
+    pub healthy: usize,
+    /// All upstreams, after name resolution. One entry per address.
+    pub total: usize,
+}
 
 /// State shared by the plugin, the server and the handles.
 #[derive(Debug)]
@@ -55,26 +71,35 @@ impl Shared {
         self.active.load(Ordering::Acquire)
     }
 
-    /// `(route, healthy, total)` for each route.
-    pub fn upstream_health(&self) -> Vec<(String, usize, usize)> {
+    /// Upstream health for each route, in route order.
+    pub fn upstream_health(&self) -> Vec<UpstreamHealth> {
         self.pools.get().map_or_else(Vec::new, |(names, pools)| {
             names
                 .iter()
                 .zip(pools.iter())
-                .map(|(name, pool)| (name.clone(), pool.healthy(), pool.total()))
+                .map(|(name, pool)| UpstreamHealth {
+                    route: name.clone(),
+                    healthy: pool.healthy(),
+                    total: pool.total(),
+                })
                 .collect()
         })
     }
 
-    /// Record a start failure. Waiters on `shutdown` return.
+    /// Record a start failure. Waiters on `shutdown` return. A proxy that
+    /// already serves does not change.
     pub fn fail(&self) {
-        let _ = self.lifecycle.apply(LifecycleEvent::StartFailed);
-        self.done.send_replace(true);
+        if self.lifecycle.apply(LifecycleEvent::StartFailed).is_ok() {
+            self.done.send_replace(true);
+        }
     }
 
+    /// Apply `event`. Wake the waiters when the state is terminal.
     fn finish(&self, event: LifecycleEvent) {
         let _ = self.lifecycle.apply(event);
-        self.done.send_replace(true);
+        if self.lifecycle.get().is_terminal() {
+            self.done.send_replace(true);
+        }
     }
 }
 
@@ -101,39 +126,62 @@ pub struct Launch {
     pub pools: Arc<Vec<Pool>>,
     pub route_names: Vec<String>,
     pub max_connections: usize,
+    pub max_connections_per_ip: usize,
     pub grace: Duration,
     pub health_interval: Option<Duration>,
 }
 
+/// The result of [`start`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Started {
+    /// The proxy serves on this address.
+    Serving(SocketAddr),
+    /// Shutdown came first. Nothing serves.
+    Stopped,
+}
+
 /// Start serving. The caller has bound the listener.
-///
-/// Returns the bound address.
 ///
 /// # Errors
 ///
-/// Returns the I/O error when the listener has no local address.
-pub fn start(shared: &Arc<Shared>, launch: Launch) -> std::io::Result<SocketAddr> {
-    let addr = launch.listener.local_addr()?;
+/// [`PingoraError::AlreadyStarted`] when another start won. An I/O error
+/// when the listener has no local address.
+pub fn start(shared: &Arc<Shared>, launch: Launch) -> Result<Started, PingoraError> {
+    let addr = launch
+        .listener
+        .local_addr()
+        .map_err(|source| PingoraError::Bind {
+            addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            source,
+        })?;
+    match shared.lifecycle.apply(LifecycleEvent::Bound) {
+        Ok(_) => {}
+        Err(Lifecycle::Stopped) => return Ok(Started::Stopped),
+        Err(_) => return Err(PingoraError::AlreadyStarted),
+    }
     let _ = shared.local_addr.set(addr);
     let _ = shared.pools.set((launch.route_names, launch.pools.clone()));
-    if shared.lifecycle.apply(LifecycleEvent::Bound).is_err() {
-        // Shutdown won the race before the bind finished.
-        return Ok(addr);
-    }
     if let Some(interval) = launch.health_interval {
         tokio::spawn(check_health(launch.pools, interval, shared.stop.clone()));
     }
     let limit =
         (launch.max_connections > 0).then(|| Arc::new(Semaphore::new(launch.max_connections)));
     let proxy = Arc::new(launch.proxy);
+    let per_ip = PerIp::new(launch.max_connections_per_ip);
+    // The guard lives in the future, so it drops even when the task never
+    // runs.
+    let exit = ExitGuard(Some(shared.clone()));
     tokio::spawn(serve(
-        shared.clone(),
+        exit,
         Listener::from(launch.listener),
         proxy,
-        limit,
+        Limits {
+            total: limit,
+            per_ip,
+        },
         launch.grace,
     ));
-    Ok(addr)
+    Ok(Started::Serving(addr))
 }
 
 /// Health check rounds until shutdown. The first round runs at once.
@@ -144,9 +192,7 @@ async fn check_health(pools: Arc<Vec<Pool>>, interval: Duration, stop: Cancellat
         tokio::select! {
             () = stop.cancelled() => return,
             _ = ticker.tick() => {
-                for pool in pools.iter() {
-                    pool.check().await;
-                }
+                futures_util::future::join_all(pools.iter().map(Pool::check)).await;
             }
         }
     }
@@ -166,35 +212,110 @@ async fn slot(
     }
 }
 
+/// Open connections per client IP.
+#[derive(Debug)]
+struct PerIp {
+    limit: usize,
+    open: Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl PerIp {
+    fn new(limit: usize) -> Option<Arc<Self>> {
+        (limit > 0).then(|| {
+            Arc::new(Self {
+                limit,
+                open: Mutex::new(HashMap::new()),
+            })
+        })
+    }
+
+    /// A slot for `ip`, or `None` at the limit.
+    fn take(self: &Arc<Self>, ip: IpAddr) -> Option<IpSlot> {
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = open.entry(ip).or_insert(0);
+        let admitted = *count < self.limit;
+        if admitted {
+            *count += 1;
+        }
+        drop(open);
+        admitted.then(|| IpSlot(self.clone(), ip))
+    }
+}
+
+/// Gives back one per-IP slot on drop.
+struct IpSlot(Arc<PerIp>, IpAddr);
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        let mut open = self.0.open.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = open.get_mut(&self.1) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.1);
+            }
+        }
+    }
+}
+
+/// Connection limits.
+struct Limits {
+    total: Option<Arc<Semaphore>>,
+    per_ip: Option<Arc<PerIp>>,
+}
+
+/// The per-IP slot for `stream`. `Err` when the client is at its limit.
+fn ip_slot(per_ip: Option<&Arc<PerIp>>, stream: &Stream) -> Result<Option<IpSlot>, ()> {
+    let Some(per_ip) = per_ip else {
+        return Ok(None);
+    };
+    let ip = stream.get_socket_digest().and_then(|digest| {
+        digest
+            .peer_addr()
+            .and_then(|a| a.as_inet())
+            .map(SocketAddr::ip)
+    });
+    ip.map_or(Ok(None), |ip| per_ip.take(ip).map(Some).ok_or(()))
+}
+
 /// Accept until shutdown, then drain.
 async fn serve(
-    shared: Arc<Shared>,
+    mut exit: ExitGuard,
     listener: Listener,
     proxy: Arc<HttpProxy<Gateway>>,
-    limit: Option<Arc<Semaphore>>,
+    limits: Limits,
     grace: Duration,
 ) {
+    let Some(shared) = exit.0.clone() else {
+        return;
+    };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
     loop {
-        let Some(permit) = slot(limit.as_ref(), &shared.stop).await else {
+        let Some(permit) = slot(limits.total.as_ref(), &shared.stop).await else {
             break;
         };
         tokio::select! {
             () = shared.stop.cancelled() => break,
             accepted = listener.accept() => match accepted {
                 Ok(stream) => {
+                    let Ok(ip) = ip_slot(limits.per_ip.as_ref(), &stream) else {
+                        tracing::debug!("pingora proxy: client at max_connections_per_ip");
+                        continue;
+                    };
                     let active = Active::new(&shared);
                     let proxy = proxy.clone();
                     let shutdown = shutdown_rx.clone();
                     connections.spawn(async move {
                         serve_connection(proxy, stream, shutdown).await;
-                        drop((active, permit));
+                        drop((active, permit, ip));
                     });
                 }
                 Err(error) => {
                     tracing::warn!(%error, "pingora proxy: accept failed");
-                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    tokio::select! {
+                        () = shared.stop.cancelled() => {}
+                        () = tokio::time::sleep(ACCEPT_BACKOFF) => {}
+                    }
                 }
             },
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
@@ -203,7 +324,21 @@ async fn serve(
     // Close the listener first: new connections get "refused".
     drop(listener);
     drain(&proxy, &shutdown_tx, &mut connections, grace).await;
+    exit.0 = None;
     shared.finish(LifecycleEvent::Drained);
+}
+
+/// Records `ServerExited` when the serve task ends early, for example when
+/// its runtime stops. Then `shutdown` does not wait forever.
+struct ExitGuard(Option<Arc<Shared>>);
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        if let Some(shared) = self.0.take() {
+            shared.stop.cancel();
+            shared.finish(LifecycleEvent::ServerExited);
+        }
+    }
 }
 
 /// End keep-alive, wait for open requests up to `grace`, then abort.
@@ -222,7 +357,7 @@ async fn drain(
     if finished.is_err() {
         tracing::warn!(
             open = connections.len(),
-            "pingora proxy: grace period over; closing open connections"
+            "pingora proxy: the grace period ended; the proxy closes the open connections"
         );
         connections.abort_all();
         while connections.join_next().await.is_some() {}
@@ -271,9 +406,9 @@ impl PingoraHandle {
         self.shared.active_connections()
     }
 
-    /// `(route, healthy, total)` upstream counts, in route order.
+    /// Upstream health for each route, in route order.
     #[must_use]
-    pub fn upstream_health(&self) -> Vec<(String, usize, usize)> {
+    pub fn upstream_health(&self) -> Vec<UpstreamHealth> {
         self.shared.upstream_health()
     }
 
@@ -283,8 +418,8 @@ impl PingoraHandle {
         crate::metrics::families(&self.shared)
     }
 
-    /// Stop the proxy and wait for the drain. Safe to call more than once,
-    /// and before boot. The drain runs in its own task, so it finishes
+    /// Stop the proxy and wait for the drain. You can call it more than one
+    /// time, also before boot. The drain runs in its own task. It continues
     /// when the caller drops this future.
     pub async fn shutdown(&self) {
         match self

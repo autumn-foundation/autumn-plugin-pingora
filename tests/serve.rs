@@ -68,7 +68,7 @@ async fn shutdown_drains_open_requests_and_refuses_new_ones() {
     let addr = handle.local_addr().unwrap();
     let slow = {
         let handle = handle.clone();
-        tokio::spawn(async move { get(&handle, "/slow/600").await })
+        tokio::spawn(async move { get(&handle, "/slow/1500").await })
     };
     let probe = handle.clone();
     assert!(
@@ -132,6 +132,10 @@ async fn the_grace_period_bounds_the_drain() {
     let started = Instant::now();
     handle.shutdown().await;
     assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "the drain waits"
+    );
+    assert!(
         started.elapsed() < Duration::from_secs(3),
         "{:?}",
         started.elapsed()
@@ -175,4 +179,46 @@ async fn autumn_shutdown_signal_starts_the_drain() {
         "{}",
         handle.state()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_closes_idle_keep_alive_connections_at_once() {
+    let a = upstream("a").await;
+    let (_http, handle) = boot(
+        plugin()
+            .configure(|c| c.shutdown_grace_ms = 5_000)
+            .route(route("a", "/", &[&a])),
+    );
+    let pooled = reqwest::Client::new();
+    let (status, _) = common::send(pooled.get(common::url(&handle, "/"))).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        handle.active_connections(),
+        1,
+        "an idle keep-alive connection"
+    );
+    let started = Instant::now();
+    handle.shutdown().await;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(handle.active_connections(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_runtime_does_not_hang_shutdown() {
+    // `TestApp` without a runtime runs the hook on a runtime that it drops.
+    let plugin = plugin();
+    let handle = plugin.handle();
+    std::thread::spawn(move || {
+        let _http = TestApp::new().plugin(plugin).build();
+    })
+    .join()
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+        .await
+        .expect("shutdown returns");
+    assert!(handle.state().is_terminal(), "{}", handle.state());
 }

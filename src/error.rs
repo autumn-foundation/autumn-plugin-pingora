@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use crate::config::ConfigError;
 
 /// A startup failure. Boot stops. The plugin never falls back silently.
+/// Autumn shows the message in its boot error.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PingoraError {
@@ -34,15 +35,15 @@ pub enum PingoraError {
     AppAddress(String),
     /// The fallback target serves TLS. v0.1 has no upstream TLS.
     #[error(
-        "`fallback = \"app\"` needs a plain HTTP app, but `[server.tls]` is set; terminate TLS in front of the proxy or set `fallback = \"none\"`"
+        "`fallback = \"app\"` needs a plain HTTP app. `[server.tls]` is set. Put a TLS terminator in front of the proxy, or set `fallback = \"none\"`"
     )]
     FallbackTls,
     /// The proxy would send unmatched requests to itself.
     #[error(
-        "the proxy listens on the Autumn app address {0}; `fallback = \"app\"` would loop. Use another `bind`"
+        "the proxy address is the Autumn app address {0}. With `fallback = \"app\"`, requests would go in a loop. Set a different `bind`"
     )]
     FallbackLoop(SocketAddr),
-    /// The startup hook ran twice.
-    #[error("the proxy has already started")]
+    /// The startup hook ran again, or the proxy stopped before it started.
+    #[error("the proxy started or stopped before; it can start one time only")]
     AlreadyStarted,
 }

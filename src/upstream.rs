@@ -123,3 +123,56 @@ fn resolve_error(route: &Route, upstream: &str, reason: &str) -> PingoraError {
         reason: reason.to_owned(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    async fn pool(selection: Selection) -> Pool {
+        let route = Route::new("r")
+            .upstreams(["127.0.0.1:1001", "127.0.0.1:1002", "127.0.0.1:1003"])
+            .selection(selection);
+        Pool::build(&route, Duration::from_millis(100))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn consistent_keys_spread_and_stay() {
+        let pool = pool(Selection::Consistent).await;
+        let mut picks = HashSet::new();
+        for client in 0..64 {
+            let key = format!("10.0.0.{client}");
+            let first = pool.select(key.as_bytes(), &[]).unwrap();
+            for _ in 0..3 {
+                assert_eq!(pool.select(key.as_bytes(), &[]), Some(first), "{key}");
+            }
+            picks.insert(first);
+        }
+        assert_eq!(picks.len(), 3, "keys use all upstreams");
+    }
+
+    #[tokio::test]
+    async fn select_skips_tried_upstreams() {
+        for selection in [Selection::RoundRobin, Selection::Consistent] {
+            let pool = pool(selection).await;
+            let first = pool.select(b"k", &[]).unwrap();
+            let second = pool.select(b"k", &[first]).unwrap();
+            assert_ne!(first, second);
+            let third = pool.select(b"k", &[first, second]).unwrap();
+            assert!(pool.select(b"k", &[first, second, third]).is_none());
+            assert_eq!(pool.total(), 3);
+            assert_eq!(pool.healthy(), 3, "healthy before the first check");
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_resolution_is_an_error() {
+        let route = Route::new("r").upstream("no-such-host.invalid:80");
+        let error = Pool::build(&route, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("route `r`"), "{error}");
+    }
+}

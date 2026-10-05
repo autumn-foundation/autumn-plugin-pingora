@@ -51,7 +51,7 @@ fn defaults_are_safe() {
     );
     assert_eq!(config.bind_addr(false).unwrap().to_string(), "0.0.0.0:8080");
     assert_eq!(config.fallback, Fallback::App);
-    assert!(config.trusted_proxies.is_empty());
+    assert_eq!(config.trusted_proxies, Vec::<String>::new());
     assert_eq!(config.max_connections_per_ip, 0);
     assert!(config.connect_timeout_ms > 0);
     assert!(config.read_timeout_ms > 0);
@@ -59,7 +59,7 @@ fn defaults_are_safe() {
     assert!(config.max_request_body_bytes > 0);
     assert!(config.max_connections > 0);
     assert_eq!(config.shutdown_grace_ms, 10_000);
-    assert!(config.routes.is_empty());
+    assert_eq!(config.routes, Vec::new());
     config.validate().unwrap();
 }
 

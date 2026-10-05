@@ -254,11 +254,11 @@ async fn http_1_0_without_host_gets_a_host_upstream() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn keep_alive_connections_are_reused() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let a = upstream("a").await;
     let (_http, handle) = boot(plugin().route(route("a", "/", &[&a])));
     // One raw connection carries all requests. A pooled client can open a
     // second connection when it returns the first to its pool late.
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect(handle.local_addr().unwrap())
         .await
         .unwrap();

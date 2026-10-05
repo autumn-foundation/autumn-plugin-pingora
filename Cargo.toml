@@ -14,7 +14,7 @@ exclude = [".github/", "docs/"]
 [dependencies]
 # `ws` gives `AppState::shutdown_token` (ADR 0003). Cargo unifies features
 # with the host app.
-autumn-web = { version = "0.7", default-features = false, features = ["ws"] }
+autumn-web = { version = "0.8", default-features = false, features = ["ws"] }
 async-trait = "0.1"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

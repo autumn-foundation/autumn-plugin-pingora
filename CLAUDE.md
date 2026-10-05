@@ -1,6 +1,6 @@
 # CLAUDE.md — autumn-plugin-pingora
 
-Pingora reverse proxy plugin for Autumn 0.7, on Pingora 0.9. One crate.
+Pingora reverse proxy plugin for Autumn 0.8, on Pingora 0.9. One crate.
 
 ## Commands
 
@@ -47,10 +47,10 @@ Pingora reverse proxy plugin for Autumn 0.7, on Pingora 0.9. One crate.
 - No behavior without a test. Work RED → GREEN → REFACTOR.
 - Docs and comments: short, ASD-STE100 (simple words, active voice).
 
-## Autumn API notes (0.7.0 on crates.io)
+## Autumn API notes (0.8.0 on crates.io)
 
 - `TestApp` runs startup hooks, not shutdown hooks. Tests call
   `PingoraHandle::shutdown`. A failed hook panics in `build()`.
-- `Plugin::contract` does not exist in 0.7.0.
+- `Plugin::contract` exists in 0.8.0 (returns `Option<PluginContract>`). This plugin does not use it yet.
 - `AppState::shutdown_token` needs the `ws` feature.
 - Health details show only with `[health] detailed = true`.

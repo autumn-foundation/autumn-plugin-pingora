@@ -256,12 +256,33 @@ async fn http_1_0_without_host_gets_a_host_upstream() {
 async fn keep_alive_connections_are_reused() {
     let a = upstream("a").await;
     let (_http, handle) = boot(plugin().route(route("a", "/", &[&a])));
-    let pooled = reqwest::Client::new();
+    // One raw connection carries all requests. A pooled client can open a
+    // second connection when it returns the first to its pool late.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(handle.local_addr().unwrap())
+        .await
+        .unwrap();
     for _ in 0..3 {
-        let (status, _) = send(pooled.get(url(&handle, "/"))).await;
-        assert_eq!(status, 200);
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        // The upstream body ends with `}`. Stop at the end of the body.
+        while !seen.ends_with(b"}") && !seen.ends_with(b"0\r\n\r\n") {
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut chunk))
+                    .await
+                    .expect("response in time")
+                    .unwrap();
+            assert_ne!(read, 0, "connection closed early");
+            seen.extend_from_slice(&chunk[..read]);
+        }
+        assert!(String::from_utf8_lossy(&seen).contains(" 200 "));
     }
     assert_eq!(handle.active_connections(), 1, "one reused connection");
+    drop(stream);
     handle.shutdown().await;
 }
 

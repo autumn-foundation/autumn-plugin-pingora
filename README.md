@@ -49,9 +49,11 @@ Run the example: `cargo run --example gateway`.
 
 ## Configuration
 
-`[pingora]` in `autumn.toml`. Profiles (`[profile.prod.pingora]`,
-`autumn-prod.toml`) and `AUTUMN_PINGORA__<KEY>` env variables apply on
-top. Code (`configure`, `route`, `bind`) applies last. A bad value stops
+`[pingora]` in `autumn.toml`. Profiles (`[profile.<name>.pingora]`,
+`autumn-<name>.toml`) and `AUTUMN_PINGORA__<KEY>` env variables apply on
+top. autumn 0.9 turns on `server.strict_config` in prod, and a
+`[profile.prod.pingora]` table then stops the boot. Put prod values in
+`autumn-prod.toml`. Code (`configure`, `route`, `bind`) applies last. A bad value stops
 boot.
 
 ```toml

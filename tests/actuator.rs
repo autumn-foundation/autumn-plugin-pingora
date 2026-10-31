@@ -11,6 +11,8 @@ use common::{boot_with, dead, eventually, get, has_line, plugin, route, upstream
 fn detailed() -> TestApp {
     let mut config = AutumnConfig::default();
     config.health.detailed = true;
+    // Autumn 0.9 caches health results for 1 s. The test reads twice.
+    config.health.cache_ttl_ms = 0;
     TestApp::new().config(config)
 }
 

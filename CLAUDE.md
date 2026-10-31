@@ -1,6 +1,6 @@
 # CLAUDE.md — autumn-plugin-pingora
 
-Pingora reverse proxy plugin for Autumn 0.8, on Pingora 0.9. One crate.
+Pingora reverse proxy plugin for Autumn 0.9, on Pingora 0.9. One crate.
 
 ## Commands
 

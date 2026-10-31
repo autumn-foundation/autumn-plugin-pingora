@@ -34,19 +34,21 @@ async fn billing_service() {
 #[autumn_web::main]
 async fn main() {
     tokio::spawn(billing_service());
-    autumn_web::app()
-        .routes(autumn_web::routes![index])
-        .plugin(
-            PingoraPlugin::new()
-                .bind("127.0.0.1:8080")
-                .route(
-                    Route::new("billing")
-                        .path_prefix("/billing")
-                        .upstream("127.0.0.1:7001")
-                        .strip_prefix(true),
-                )
-                .public(),
-        )
-        .run()
-        .await;
+    Box::pin(
+        autumn_web::app()
+            .routes(autumn_web::routes![index])
+            .plugin(
+                PingoraPlugin::new()
+                    .bind("127.0.0.1:8080")
+                    .route(
+                        Route::new("billing")
+                            .path_prefix("/billing")
+                            .upstream("127.0.0.1:7001")
+                            .strip_prefix(true),
+                    )
+                    .public(),
+            )
+            .run(),
+    )
+    .await;
 }

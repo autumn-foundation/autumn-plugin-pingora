@@ -1,8 +1,8 @@
 [package]
 name = "autumn-plugin-pingora"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.88.0"
+rust-version = "1.97.0"
 license = "Apache-2.0"
 description = "Pingora reverse proxy for Autumn: routes, load balancing, health checks, app fallback, metrics and graceful drain"
 repository = "https://github.com/autumn-foundation/autumn-plugin-pingora"
@@ -14,7 +14,7 @@ exclude = [".github/", "docs/"]
 [dependencies]
 # `ws` gives `AppState::shutdown_token` (ADR 0003). Cargo unifies features
 # with the host app.
-autumn-web = { version = "0.9", default-features = false, features = ["ws"] }
+autumn-web = { version = "0.10", default-features = false, features = ["ws"] }
 async-trait = "0.1"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

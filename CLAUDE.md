@@ -22,6 +22,8 @@ Pingora reverse proxy plugin for Autumn 0.10, on Pingora 0.9. One crate.
 
 ## Rules
 
+- README Rust snippets are doctests. Make them compile; use `no_run`, not `ignore`.
+  `tests/doc_snippets.rs` checks the TOML snippets and the version pins in the docs.
 - **Do not use Pingora's `Server` or listening `Service`** (ADR 0001).
   Autumn owns the process and the runtime.
 - **State changes only through `LifecycleCell::apply`.** Change the spec

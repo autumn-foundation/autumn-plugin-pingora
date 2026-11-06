@@ -6,8 +6,14 @@ A [Pingora](https://github.com/cloudflare/pingora) reverse proxy for
 The proxy has its own port. It sends matched requests to upstream pools.
 It sends all other requests to your Autumn app.
 
-```rust
+```rust,no_run
 use autumn_plugin_pingora::{PingoraPlugin, Route};
+
+// Autumn needs one typed route to boot.
+#[autumn_web::get("/")]
+async fn index() -> &'static str {
+    "gateway"
+}
 
 #[autumn_web::main]
 async fn main() {

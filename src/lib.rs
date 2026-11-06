@@ -53,3 +53,8 @@ pub use error::PingoraError;
 pub use lifecycle::{Lifecycle, LifecycleCell, LifecycleEvent};
 pub use plugin::{PLUGIN_NAME, PingoraPlugin};
 pub use server::{PingoraHandle, UpstreamHealth};
+
+/// Compiles the Rust snippets of the README as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
